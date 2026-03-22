@@ -1,0 +1,17 @@
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    container_name: kairos_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: kairos
+      POSTGRES_PASSWORD: kairos_dev
+      POSTGRES_DB: kairos
+    ports:
+      - "5432:5432"
+    volumes:
+      - kairos_pgdata:/var/lib/postgresql/data
+      - ./backend/db/init.sql:/docker-entrypoint-initdb.d/init.sql
+
+volumes:
+  kairos_pgdata:

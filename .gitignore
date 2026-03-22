@@ -1,0 +1,11 @@
+.env
+backend/.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+backend/logs/
+.DS_Store
+node_modules/
+.next/
+dist/
