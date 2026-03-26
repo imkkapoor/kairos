@@ -110,14 +110,19 @@ CREATE TABLE IF NOT EXISTS watchlist (
 );
 
 -- ---------------------------------------------------------------------------
--- fetch_log: audit trail for every yfinance fetch attempt
+-- fetch_log: one row per calendar day summarising the full fetch run
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS fetch_log (
-    id            SERIAL PRIMARY KEY,
-    time          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    ticker        TEXT        NOT NULL,
-    interval      TEXT        NOT NULL,
-    rows_inserted INTEGER     NOT NULL,
-    status        TEXT        CHECK (status IN ('success', 'error')),
-    error_msg     TEXT
+    id              SERIAL PRIMARY KEY,
+    date            DATE NOT NULL,
+    tickers_total   INTEGER NOT NULL,
+    tickers_success INTEGER NOT NULL,
+    tickers_skipped INTEGER NOT NULL,
+    tickers_failed  INTEGER NOT NULL,
+    failed_tickers  TEXT,
+    rows_inserted   INTEGER NOT NULL,
+    duration_secs   DOUBLE PRECISION,
+    notes           TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT fetch_log_date_unique UNIQUE (date)
 );

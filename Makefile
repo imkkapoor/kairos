@@ -2,7 +2,7 @@ VENV   := backend/.venv
 PYTHON := $(VENV)/bin/python
 PIP    := $(VENV)/bin/pip
 
-.PHONY: install up down logs setup run fetch shell-db reset-db help \
+.PHONY: install up down logs setup run scan fetch retry-failed shell-db reset-db help \
         _guard-docker _guard-venv
 
 ## install: Create .venv, upgrade pip, install all requirements
@@ -28,7 +28,7 @@ down:
 logs:
 	docker compose logs -f
 
-## setup: Init schema, seed watchlist, backfill 5 years of OHLCV data
+## setup: Init schema, seed watchlist (S&P500 + TSX60 + watchlist_extra.csv), backfill OHLCV
 setup: _guard-docker _guard-venv
 	$(PYTHON) backend/setup.py
 
@@ -36,9 +36,17 @@ setup: _guard-docker _guard-venv
 run: _guard-docker _guard-venv
 	$(PYTHON) backend/scheduler.py
 
+## scan: Run the daily signal scan once right now (skips schedule)
+scan: _guard-docker _guard-venv
+	$(PYTHON) -c "import sys; sys.path.insert(0, 'backend'); from strategies.scanner import run_daily_scan; run_daily_scan()"
+
 ## fetch: Incremental update for all active watchlist tickers
 fetch:
 	$(PYTHON) backend/data/fetcher.py update
+
+## retry-failed: Retry tickers that failed in last fetch (DATE=YYYY-MM-DD, default: today)
+retry-failed: _guard-docker _guard-venv
+	$(PYTHON) backend/data/fetcher.py retry-failed $(if $(DATE),--date $(DATE),)
 
 ## shell-db: Open an interactive psql session inside kairos_db
 shell-db:
@@ -61,6 +69,7 @@ help:
 	@echo "Kairos — Algorithmic Paper Trading System"
 	@echo "========================================="
 	@echo "First-time setup:  make install  →  make up  →  make setup  →  make run"
+	@echo "Run scan now:      make scan"
 	@echo ""
 	@echo "Targets:"
 	@awk '/^## /{sub(/^## /,""); split($$0, a, ": "); printf "  %-12s %s\n", a[1], a[2]}' $(MAKEFILE_LIST)

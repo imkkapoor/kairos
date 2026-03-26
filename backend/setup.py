@@ -108,6 +108,41 @@ def _fetch_sp500() -> list[dict]:
     return df.to_dict("records")
 
 
+def _load_extra_tickers() -> list[dict]:
+    """Load extra tickers from watchlist_extra.csv (ETFs, custom stocks, etc.).
+
+    The CSV lives at backend/watchlist_extra.csv. Add any row you want tracked
+    by Kairos — ETFs, individual stocks, whatever. Required column: ``ticker``.
+    Optional: ``name``, ``sector``, ``market`` (default US), ``notes``.
+    Blank lines and lines starting with # are ignored.
+    """
+    csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "watchlist_extra.csv")
+    if not os.path.exists(csv_path):
+        logger.info("watchlist_extra.csv not found — skipping extra tickers")
+        return []
+
+    df = pd.read_csv(csv_path, comment="#", skip_blank_lines=True, dtype=str)
+    df.columns = [c.strip().lower() for c in df.columns]
+    if "ticker" not in df.columns:
+        logger.warning("watchlist_extra.csv has no 'ticker' column — skipping")
+        return []
+
+    df = df.where(pd.notna(df), None)  # convert NaN → None for clean DB inserts
+    results = []
+    for _, row in df.iterrows():
+        ticker = str(row["ticker"]).strip()
+        if not ticker or ticker.lower() == "nan":
+            continue
+        results.append({
+            "ticker": ticker,
+            "name":   row.get("name"),
+            "sector": row.get("sector"),
+            "market": row.get("market") or "US",
+            "notes":  row.get("notes"),
+        })
+    return results
+
+
 def _fetch_tsx60() -> list[dict]:
     """Fetch TSX 60 constituents from Wikipedia.
 
@@ -154,6 +189,16 @@ def _fetch_tsx60() -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Blacklist — tickers to exclude even if found on Wikipedia or in the CSV
+# ---------------------------------------------------------------------------
+# Add any ticker that causes yfinance errors, returns garbage data, or is
+# otherwise unwanted. Exact match, case-sensitive.
+_TICKER_BLACKLIST: set[str] = {
+    "Q",   # Quintiles/IQVIA old symbol — yfinance returns bad/empty data
+}
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -196,6 +241,19 @@ def main() -> None:
     except Exception as exc:
         logger.error(f"Failed to fetch TSX 60 from Wikipedia: {exc}")
 
+    # Load extra tickers from watchlist_extra.csv (ETFs, custom stocks, etc.)
+    extra = _load_extra_tickers()
+    if extra:
+        logger.info(f"watchlist_extra.csv: {len(extra)} tickers loaded")
+        tickers.extend(extra)
+
+    # Apply blacklist
+    before = len(tickers)
+    tickers = [t for t in tickers if t["ticker"] not in _TICKER_BLACKLIST]
+    removed = before - len(tickers)
+    if removed:
+        logger.info(f"Blacklist removed {removed} ticker(s): {_TICKER_BLACKLIST & {t['ticker'] for t in tickers} ^ _TICKER_BLACKLIST}")
+
     if not tickers:
         logger.error("No tickers were fetched — cannot seed watchlist. Aborting.")
         sys.exit(1)
@@ -212,7 +270,7 @@ def main() -> None:
     print()
     print("=" * 56)
     print("  Kairos setup complete!")
-    print(f"  Watchlist : {len(tickers)} tickers seeded (S&P 500 + TSX 60)")
+    print(f"  Watchlist : {len(tickers)} tickers seeded (S&P 500 + TSX 60 + watchlist_extra.csv)")
     print("  Data      : ~11yr daily OHLCV backfilled (~2015–present)")
     print("  Next step : make run")
     print("=" * 56)

@@ -26,7 +26,7 @@ from db.connection import (  # noqa: E402
     get_latest_timestamp,
     get_watchlist,
     insert_price_data,
-    log_fetch,
+    log_daily_fetch,
 )
 
 try:
@@ -153,7 +153,7 @@ def _normalise(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
 # Public API
 # ---------------------------------------------------------------------------
 
-def backfill(ticker: str, interval: str = "1d", years: int = 11) -> int:
+def backfill(ticker: str, interval: str = "1d", years: int = 10) -> dict:
     """Fetch and store N years of historical OHLCV data for a single ticker.
 
     Parameters
@@ -167,8 +167,8 @@ def backfill(ticker: str, interval: str = "1d", years: int = 11) -> int:
 
     Returns
     -------
-    int
-        Number of rows inserted into price_data.
+    dict
+        {status: 'success'|'error', rows: int, ticker: str}
     """
     today      = datetime.now(timezone.utc).date()
     start_date = today - timedelta(days=years * 365)
@@ -181,21 +181,19 @@ def backfill(ticker: str, interval: str = "1d", years: int = 11) -> int:
     df = _normalise(df, ticker)
 
     if df.empty:
-        log_fetch(ticker, interval, 0, "error", "empty DataFrame after fetch/normalise")
-        return 0
+        logger.warning(f"[{ticker}] empty DataFrame after fetch/normalise")
+        return {"status": "error", "rows": 0, "ticker": ticker}
 
     try:
         rows = insert_price_data(df, ticker, interval)
-        log_fetch(ticker, interval, rows, "success")
         logger.info(f"[{ticker}] backfill inserted {rows} rows")
-        return rows
+        return {"status": "success", "rows": rows, "ticker": ticker}
     except Exception as exc:
-        log_fetch(ticker, interval, 0, "error", str(exc))
         logger.error(f"[{ticker}] DB insert error during backfill: {exc}")
-        return 0
+        return {"status": "error", "rows": 0, "ticker": ticker}
 
 
-def update(ticker: str, interval: str = "1d") -> int:
+def update(ticker: str, interval: str = "1d") -> dict:
     """Incrementally update a ticker since its last stored timestamp.
 
     If no data exists in the DB, falls back to a full backfill().
@@ -210,8 +208,8 @@ def update(ticker: str, interval: str = "1d") -> int:
 
     Returns
     -------
-    int
-        Number of rows inserted.
+    dict
+        {status: 'success'|'skipped'|'error', rows: int, ticker: str}
     """
     latest = get_latest_timestamp(ticker, interval)
     if latest is None:
@@ -223,8 +221,7 @@ def update(ticker: str, interval: str = "1d") -> int:
 
     if start_date > today:
         logger.debug(f"[{ticker}] already up-to-date (latest: {latest.date()})")
-        log_fetch(ticker, interval, 0, "success")
-        return 0
+        return {"status": "skipped", "rows": 0, "ticker": ticker}
 
     start = start_date.isoformat()
     end   = today.isoformat()
@@ -235,21 +232,19 @@ def update(ticker: str, interval: str = "1d") -> int:
     df = _normalise(df, ticker)
 
     if df.empty:
-        log_fetch(ticker, interval, 0, "error", "empty DataFrame after fetch/normalise")
-        return 0
+        logger.warning(f"[{ticker}] empty DataFrame after fetch/normalise")
+        return {"status": "error", "rows": 0, "ticker": ticker}
 
     try:
         rows = insert_price_data(df, ticker, interval)
-        log_fetch(ticker, interval, rows, "success")
         logger.info(f"[{ticker}] update inserted {rows} rows")
-        return rows
+        return {"status": "success", "rows": rows, "ticker": ticker}
     except Exception as exc:
-        log_fetch(ticker, interval, 0, "error", str(exc))
         logger.error(f"[{ticker}] DB insert error during update: {exc}")
-        return 0
+        return {"status": "error", "rows": 0, "ticker": ticker}
 
 
-def backfill_all(interval: str = "1d", years: int = 11) -> None:
+def backfill_all(interval: str = "1d", years: int = 10) -> None:
     """Backfill all active watchlist tickers, displaying a rich progress bar.
 
     Parameters
@@ -262,6 +257,26 @@ def backfill_all(interval: str = "1d", years: int = 11) -> None:
     tickers = get_watchlist(active_only=True)
     logger.info(f"Starting backfill for {len(tickers)} tickers ({years}yr, {interval})")
 
+    t_start   = _time.monotonic()
+    n_success = n_skipped = n_failed = n_rows = 0
+    failed_list: list[str] = []
+
+    def _run(ticker: str) -> None:
+        nonlocal n_success, n_skipped, n_failed, n_rows
+        try:
+            result = backfill(ticker, interval, years)
+        except Exception as exc:
+            logger.error(f"[{ticker}] unexpected error: {exc}")
+            result = {"status": "error", "rows": 0, "ticker": ticker}
+        if result["status"] == "success":
+            n_success += 1
+            n_rows    += result["rows"]
+        elif result["status"] == "skipped":
+            n_skipped += 1
+        else:
+            n_failed += 1
+            failed_list.append(ticker)
+
     if _RICH_AVAILABLE:
         with Progress(
             SpinnerColumn(),
@@ -273,20 +288,30 @@ def backfill_all(interval: str = "1d", years: int = 11) -> None:
             task = progress.add_task("Backfilling...", total=len(tickers))
             for ticker in tickers:
                 progress.update(task, description=f"[cyan]{ticker}[/cyan]")
-                try:
-                    backfill(ticker, interval, years)
-                except Exception as exc:
-                    logger.error(f"[{ticker}] unexpected error: {exc}")
+                _run(ticker)
                 _time.sleep(_RATE_DELAY)
                 progress.advance(task)
     else:
         for i, ticker in enumerate(tickers, 1):
             logger.info(f"[{i}/{len(tickers)}] {ticker}")
-            try:
-                backfill(ticker, interval, years)
-            except Exception as exc:
-                logger.error(f"[{ticker}] unexpected error: {exc}")
+            _run(ticker)
             _time.sleep(_RATE_DELAY)
+
+    duration = _time.monotonic() - t_start
+    log_daily_fetch(
+        date            = _time.strftime("%Y-%m-%d", _time.gmtime()),
+        tickers_total   = len(tickers),
+        tickers_success = n_success,
+        tickers_skipped = n_skipped,
+        tickers_failed  = n_failed,
+        failed_tickers  = failed_list,
+        rows_inserted   = n_rows,
+        duration_secs   = round(duration, 2),
+    )
+    logger.info(
+        f"backfill_all complete — {n_success} ok, {n_skipped} skipped, "
+        f"{n_failed} failed, {n_rows} rows inserted in {duration:.1f}s"
+    )
 
 
 def update_all(interval: str = "1d") -> int:
@@ -305,17 +330,129 @@ def update_all(interval: str = "1d") -> int:
     tickers = get_watchlist(active_only=True)
     logger.info(f"Incremental update for {len(tickers)} tickers ({interval})")
 
-    total = 0
+    t_start   = _time.monotonic()
+    n_success = n_skipped = n_failed = n_rows = 0
+    failed_list: list[str] = []
+
     for ticker in tickers:
         try:
-            rows = update(ticker, interval)
-            total += rows
+            result = update(ticker, interval)
         except Exception as exc:
             logger.error(f"[{ticker}] unexpected error: {exc}")
+            result = {"status": "error", "rows": 0, "ticker": ticker}
+        if result["status"] == "success":
+            n_success += 1
+            n_rows    += result["rows"]
+        elif result["status"] == "skipped":
+            n_skipped += 1
+        else:
+            n_failed += 1
+            failed_list.append(ticker)
         _time.sleep(_RATE_DELAY)
 
-    logger.info(f"update_all complete — {total} rows inserted across all tickers")
-    return total
+    duration = _time.monotonic() - t_start
+    log_daily_fetch(
+        date            = _time.strftime("%Y-%m-%d", _time.gmtime()),
+        tickers_total   = len(tickers),
+        tickers_success = n_success,
+        tickers_skipped = n_skipped,
+        tickers_failed  = n_failed,
+        failed_tickers  = failed_list,
+        rows_inserted   = n_rows,
+        duration_secs   = round(duration, 2),
+    )
+    logger.info(
+        f"update_all complete — {n_success} ok, {n_skipped} skipped, "
+        f"{n_failed} failed, {n_rows} rows inserted in {duration:.1f}s"
+    )
+    return n_rows
+
+
+# ---------------------------------------------------------------------------
+# Retry failed tickers from fetch_log
+# ---------------------------------------------------------------------------
+
+def retry_failed(date_str: str | None = None, interval: str = "1d") -> None:
+    """Backfill any tickers that failed on a given calendar date.
+
+    Reads ``failed_tickers`` from the fetch_log row for *date_str*
+    (YYYY-MM-DD, defaults to today UTC) and runs a full backfill() for each.
+    Updates the fetch_log row with the new counts when done.
+
+    Parameters
+    ----------
+    date_str:
+        Calendar date to look up (e.g. "2026-03-24").  Defaults to today UTC.
+    interval:
+        Bar interval (default "1d").
+    """
+    from db.connection import get_fetch_history  # local import avoids circular at module level
+
+    if date_str is None:
+        date_str = _time.strftime("%Y-%m-%d", _time.gmtime())
+
+    logger.info(f"retry_failed: looking up fetch_log for {date_str}")
+
+    df = get_fetch_history(days=90)
+    if df.empty:
+        logger.warning("fetch_log is empty — nothing to retry")
+        return
+
+    # Normalise date column to plain strings for comparison
+    row = df[df["date"].astype(str).str.startswith(date_str)]
+    if row.empty:
+        logger.warning(f"No fetch_log entry found for {date_str}")
+        return
+
+    failed_str = row.iloc[0]["failed_tickers"]
+    if not failed_str or (isinstance(failed_str, float)):  # NULL comes back as float NaN
+        logger.info(f"No failed tickers recorded for {date_str} — nothing to do")
+        return
+
+    tickers = [t.strip() for t in str(failed_str).split(",") if t.strip()]
+    if not tickers:
+        logger.info(f"No failed tickers for {date_str}")
+        return
+
+    logger.info(f"retry_failed: {len(tickers)} tickers to retry: {tickers}")
+
+    t_start   = _time.monotonic()
+    n_success = n_failed = n_rows = 0
+    still_failed: list[str] = []
+
+    for ticker in tickers:
+        try:
+            result = backfill(ticker, interval)
+        except Exception as exc:
+            logger.error(f"[{ticker}] unexpected error: {exc}")
+            result = {"status": "error", "rows": 0, "ticker": ticker}
+        if result["status"] == "success":
+            n_success += 1
+            n_rows    += result["rows"]
+        else:
+            n_failed += 1
+            still_failed.append(ticker)
+        _time.sleep(_RATE_DELAY)
+
+    duration = _time.monotonic() - t_start
+
+    # Update the fetch_log row for this date with revised counts
+    original = row.iloc[0]
+    log_daily_fetch(
+        date            = date_str,
+        tickers_total   = int(original["tickers_total"]),
+        tickers_success = int(original["tickers_success"]) + n_success,
+        tickers_skipped = int(original["tickers_skipped"]),
+        tickers_failed  = n_failed,
+        failed_tickers  = still_failed,
+        rows_inserted   = int(original["rows_inserted"]) + n_rows,
+        duration_secs   = round(float(original["duration_secs"] or 0) + duration, 2),
+        notes           = f"retried {len(tickers)} failed; {n_success} recovered",
+    )
+    logger.info(
+        f"retry_failed complete — {n_success} recovered, {n_failed} still failing, "
+        f"{n_rows} rows inserted in {duration:.1f}s"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -332,11 +469,15 @@ if __name__ == "__main__":
     bp = subparsers.add_parser("backfill", help="Fetch full historical data")
     bp.add_argument("--ticker",   type=str, help="Single ticker (omit for all watchlist tickers)")
     bp.add_argument("--interval", type=str, default="1d",  help="Bar interval (default: 1d)")
-    bp.add_argument("--years",    type=int, default=11,    help="Years of history (default: 11)")
+    bp.add_argument("--years",    type=int, default=10,    help="Years of history (default: 10)")
 
     up = subparsers.add_parser("update", help="Incremental update since last stored bar")
     up.add_argument("--ticker",   type=str, help="Single ticker (omit for all watchlist tickers)")
     up.add_argument("--interval", type=str, default="1d",  help="Bar interval (default: 1d)")
+
+    rp = subparsers.add_parser("retry-failed", help="Retry tickers that failed on a given date")
+    rp.add_argument("--date",     type=str, default=None,  help="Date to retry (YYYY-MM-DD, default: today)")
+    rp.add_argument("--interval", type=str, default="1d",  help="Bar interval (default: 1d)")
 
     args = parser.parse_args()
 
@@ -351,3 +492,6 @@ if __name__ == "__main__":
             update(args.ticker, args.interval)
         else:
             update_all(args.interval)
+
+    elif args.command == "retry-failed":
+        retry_failed(args.date, args.interval)

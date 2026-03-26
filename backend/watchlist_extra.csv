@@ -1,0 +1,43 @@
+ticker,name,sector,market,notes
+SPY,SPDR S&P 500 ETF,ETF - Broad Market,US,Crisis proxy for regime detector
+QQQ,Invesco Nasdaq-100 ETF,ETF - Broad Market,US,Tech-heavy large cap
+IWM,iShares Russell 2000 ETF,ETF - Broad Market,US,Small cap benchmark
+DIA,SPDR Dow Jones ETF,ETF - Broad Market,US,Blue chip 30
+VTI,Vanguard Total Market ETF,ETF - Broad Market,US,Entire US market
+XLK,Technology Select SPDR,ETF - Technology,US,S&P tech sector
+XLF,Financial Select SPDR,ETF - Financials,US,S&P financials sector
+XLE,Energy Select SPDR,ETF - Energy,US,S&P energy sector
+XLV,Health Care Select SPDR,ETF - Healthcare,US,S&P healthcare sector
+XLI,Industrial Select SPDR,ETF - Industrials,US,S&P industrials sector
+XLY,Consumer Discret SPDR,ETF - Cons Disc,US,S&P consumer discretionary
+XLP,Consumer Staples SPDR,ETF - Cons Staples,US,S&P consumer staples
+XLU,Utilities Select SPDR,ETF - Utilities,US,S&P utilities sector
+XLB,Materials Select SPDR,ETF - Materials,US,S&P materials sector
+XLRE,Real Estate Select SPDR,ETF - Real Estate,US,S&P real estate sector
+XLC,Comm Services Select SPDR,ETF - Comm Services,US,S&P communication services
+GLD,SPDR Gold Shares,ETF - Commodity,US,Gold — rises in crisis
+TLT,iShares 20+ Year Treasury,ETF - Bonds,US,Long bonds — inverse stocks
+SHY,iShares 1-3 Year Treasury,ETF - Bonds,US,Short bonds — cash proxy
+XIU.TO,iShares S&P/TSX 60 Index ETF,ETF - CA Broad Market,CA,Most popular Canadian ETF
+XIC.TO,iShares S&P/TSX Capped Composite ETF,ETF - CA Broad Market,CA,Full TSX composite
+VCN.TO,Vanguard FTSE Canada All-Cap ETF,ETF - CA Broad Market,CA,Includes small-caps
+HXT.TO,Horizons S&P/TSX 60 ETF,ETF - CA Broad Market,CA,Cheapest tax efficient
+VFV.TO,Vanguard S&P 500 Index ETF (CAD),ETF - CA Broad Market,CA,S&P 500 exposure in CAD
+XFN.TO,iShares S&P/TSX Capped Financials ETF,ETF - CA Financials,CA,Big 6 banks + insurers
+XEG.TO,iShares S&P/TSX Capped Energy ETF,ETF - CA Energy,CA,Oil sands + pipelines
+XGD.TO,iShares S&P/TSX Global Gold Index ETF,ETF - CA Materials,CA,Gold miners
+XIT.TO,iShares S&P/TSX Capped Info Tech ETF,ETF - CA Technology,CA,Includes Shopify
+XRE.TO,iShares S&P/TSX Capped REIT ETF,ETF - CA Real Estate,CA,Canadian REITs
+ZEB.TO,BMO Equal Weight Banks Index ETF,ETF - CA Financials,CA,Equal weight Big 6 banks
+ZAG.TO,BMO Aggregate Bond Index ETF,ETF - CA Bonds,CA,Broad Canadian bond market
+XBB.TO,iShares Core Canadian Universe Bond ETF,ETF - CA Bonds,CA,Govt + corporate bonds
+SOXX,iShares Semiconductor ETF,ETF - Semiconductors,US,AI/chip cycle signals — most important addition
+SMH,VanEck Semiconductor ETF,ETF - Semiconductors,US,Alternative to SOXX high correlation
+ARKK,ARK Innovation ETF,ETF - Thematic,US,Extremely volatile great RSI signals
+SCHD,Schwab US Dividend Equity ETF,ETF - Dividend,US,Defensive counter-signal to growth
+JEPI,JPMorgan Equity Premium Income ETF,ETF - Income,US,Low vol good mean reversion candidate
+HACK,ETFMG Prime Cyber Security ETF,ETF - Cybersecurity,US,Distinct signals from XLK
+SHOP,Shopify Inc.,Technology,US,NYSE listed massive volume
+COIN,Coinbase Global,Financials,US,High beta great RSI opportunities
+PLTR,Palantir Technologies,Technology,US,Recently added to S&P 500 very active
+HOOD,Robinhood Markets,Financials,US,High retail interest volatile signals

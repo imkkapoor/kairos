@@ -46,8 +46,9 @@ def _job_update_all() -> None:
 
 
 def _job_strategy_scan() -> None:
-    """17:15 ET weekdays — strategy scan (Phase 2)."""
-    logger.info("Strategy scan — Phase 2")
+    """17:15 ET weekdays — run daily signal scan (Phase 2)."""
+    from strategies.scanner import run_daily_scan
+    run_daily_scan()
 
 
 def _job_simulator() -> None:
