@@ -4,8 +4,9 @@ scheduler.py — Long-running weekday job scheduler for Kairos.
 Jobs (all times Eastern Time, DST-aware via zoneinfo):
   07:00 ET weekdays  — Morning digest placeholder (Phase 6)
   17:00 ET weekdays  — Incremental OHLCV update via update_all()
-  17:15 ET weekdays  — Strategy scan placeholder (Phase 2)
-  17:20 ET weekdays  — Simulator placeholder (Phase 3)
+  17:15 ET weekdays  — Strategy scan: compute indicators + generate signals
+  09:31 ET weekdays  — Morning execution: live batch price fetch + execute signals
+  17:25 ET weekdays  — Evening management: DB close prices + position management
   Every hour (daily) — DB health check (runs weekends too)
 
 The scheduler polls every 30 seconds. ET-timed jobs use a zoneinfo-based
@@ -34,6 +35,11 @@ _ET = ZoneInfo("America/New_York")
 _fired: set[tuple] = set()
 
 
+def _is_weekday() -> bool:
+    """Return True if today is Monday–Friday in ET."""
+    return datetime.now(_ET).weekday() < 5
+
+
 # ---------------------------------------------------------------------------
 # Job implementations
 # ---------------------------------------------------------------------------
@@ -46,14 +52,25 @@ def _job_update_all() -> None:
 
 
 def _job_strategy_scan() -> None:
-    """17:15 ET weekdays — run daily signal scan (Phase 2)."""
+    """17:15 ET weekdays — run daily signal scan."""
     from strategies.scanner import run_daily_scan
     run_daily_scan()
 
 
-def _job_simulator() -> None:
-    """17:20 ET weekdays — simulator (Phase 3)."""
-    logger.info("Simulator — Phase 3")
+def _job_morning_execution() -> None:
+    """09:31 ET weekdays — fetch live prices in batch + execute last night's signals."""
+    if not _is_weekday():
+        return
+    from simulator.simulator import run_morning
+    run_morning()
+
+
+def _job_evening_management() -> None:
+    """17:25 ET weekdays — DB close prices + position management."""
+    if not _is_weekday():
+        return
+    from simulator.simulator import run_evening
+    run_evening()
 
 
 def _job_morning_digest() -> None:
@@ -76,9 +93,10 @@ def _job_health_check() -> None:
 # (hour_ET, minute_ET, weekday_only, job_function)
 _ET_JOBS = [
     (7,  0,  True,  _job_morning_digest),
+    (9,  31, True,  _job_morning_execution),
     (17, 0,  True,  _job_update_all),
     (17, 15, True,  _job_strategy_scan),
-    (17, 20, True,  _job_simulator),
+    (17, 25, True,  _job_evening_management),
 ]
 
 
@@ -130,10 +148,21 @@ def main() -> None:
 
     logger.info(
         "Scheduler running. "
-        "ET jobs: 07:00 digest (P6), 17:00 fetch, 17:15 scan (P2), 17:20 sim (P3). "
+        "ET jobs: 07:00 digest (P6), 09:31 morning execution, "
+        "17:00 fetch, 17:15 scan, 17:25 evening management. "
         "Hourly health check active. "
         "Press Ctrl+C to stop."
     )
+
+    
+    print(r"""
+.------..------..------..------..------..------.
+|K.--. ||A.--. ||I.--. ||R.--. ||O.--. ||S.--. |
+| :/\: || (\/) || (\/) || :(): || :/\: || :/\: |
+| :\/: || :\/: || :\/: || ()() || :\/: || :\/: |
+| '--'K|| '--'A|| '--'I|| '--'R|| '--'O|| '--'S|
+`------'`------'`------'`------'`------'`------'
+    """)
 
     try:
         while True:

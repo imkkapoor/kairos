@@ -353,7 +353,6 @@ def get_latest_timestamp(ticker: str, interval: str = "1d") -> Optional[pd.Times
 # ---------------------------------------------------------------------------
 
 def log_daily_fetch(
-    date,
     tickers_total: int,
     tickers_success: int,
     tickers_skipped: int,
@@ -363,41 +362,29 @@ def log_daily_fetch(
     duration_secs: float,
     notes: Optional[str] = None,
 ) -> None:
-    """Upsert one summary row per calendar day into fetch_log.
-
-    ON CONFLICT (date) updates all fields so re-runs overwrite the previous entry.
-    """
+    """Insert one summary row into fetch_log."""
     failed_str = ",".join(failed_tickers) if failed_tickers else None
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO fetch_log
-                    (date, tickers_total, tickers_success, tickers_skipped,
+                    (tickers_total, tickers_success, tickers_skipped,
                      tickers_failed, failed_tickers, rows_inserted, duration_secs, notes)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (date) DO UPDATE SET
-                    tickers_total   = EXCLUDED.tickers_total,
-                    tickers_success = EXCLUDED.tickers_success,
-                    tickers_skipped = EXCLUDED.tickers_skipped,
-                    tickers_failed  = EXCLUDED.tickers_failed,
-                    failed_tickers  = EXCLUDED.failed_tickers,
-                    rows_inserted   = EXCLUDED.rows_inserted,
-                    duration_secs   = EXCLUDED.duration_secs,
-                    notes           = EXCLUDED.notes
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 """,
-                (date, tickers_total, tickers_success, tickers_skipped,
+                (tickers_total, tickers_success, tickers_skipped,
                  tickers_failed, failed_str, rows_inserted, duration_secs, notes),
             )
 
 
 def get_fetch_history(days: int = 30) -> pd.DataFrame:
-    """Return the last *days* rows from fetch_log, ordered by date DESC."""
+    """Return the last *days* rows from fetch_log, ordered by fetch_time DESC."""
     engine = get_engine()
     query = text(
-        "SELECT * FROM fetch_log ORDER BY date DESC LIMIT :days"
+        "SELECT * FROM fetch_log ORDER BY fetch_time DESC LIMIT :days"
     )
-    return pd.read_sql(query, engine, params={"days": days}, parse_dates=["date", "created_at"])
+    return pd.read_sql(query, engine, params={"days": days}, parse_dates=["fetch_time"])
 
 
 # ---------------------------------------------------------------------------
@@ -411,32 +398,34 @@ def save_portfolio_snapshot(
     daily_pnl: Optional[float] = None,
     total_pnl: Optional[float] = None,
     drawdown: Optional[float] = None,
+    currency: str = "CAD",
 ) -> None:
     """Persist a point-in-time portfolio snapshot.
 
     Parameters
     ----------
     cash:
-        Current cash balance in dollars.
+        Current cash balance in portfolio base currency.
     total_value:
-        Total portfolio value (cash + open positions) in dollars.
+        Total portfolio value (cash + open positions) in portfolio base currency.
     positions:
         JSON-serialisable dict mapping ticker → position details.
-        Must include enough context for Phase 3 position management.
     daily_pnl:
         Profit/loss for the current trading day (can be None).
     total_pnl:
         Cumulative profit/loss since inception (can be None).
     drawdown:
         Current drawdown as a fraction of peak value (can be None).
+    currency:
+        Portfolio base currency code (default 'CAD').
     """
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO portfolio_snapshots
-                    (cash, total_value, positions, daily_pnl, total_pnl, drawdown)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                    (cash, total_value, positions, daily_pnl, total_pnl, drawdown, currency)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     cash,
@@ -445,6 +434,7 @@ def save_portfolio_snapshot(
                     daily_pnl,
                     total_pnl,
                     drawdown,
+                    currency,
                 ),
             )
 
@@ -512,8 +502,9 @@ def insert_indicator_row(ticker: str, interval: str, row: dict) -> None:
                     (time, ticker, interval,
                      rsi_14, ma_50, ma_200, ema_20,
                      bb_upper, bb_mid, bb_lower,
-                     atr_14, adx_14, volume_sma)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     atr_14, adx_14, volume_sma,
+                     macd_line, macd_signal, macd_hist, roc_20)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (time, ticker, interval) DO NOTHING
                 """,
                 (
@@ -530,23 +521,37 @@ def insert_indicator_row(ticker: str, interval: str, row: dict) -> None:
                     row.get("atr_14"),
                     row.get("adx_14"),
                     row.get("volume_sma"),
+                    row.get("macd_line"),
+                    row.get("macd_signal"),
+                    row.get("macd_hist"),
+                    row.get("roc_20"),
                 ),
             )
 
 
 def get_todays_indicators(
-    tickers: list[str], interval: str = "1d"
+    tickers: list[str],
+    interval: str = "1d",
+    for_date: Optional[datetime] = None,
 ) -> dict[str, dict]:
-    """Bulk fetch today's indicator rows for the given tickers in a single query.
+    """Bulk fetch indicator rows for the given tickers for a specific date.
 
-    Returns {ticker: row_dict}. Tickers with no row for today are absent from the result.
+    Parameters
+    ----------
+    for_date:
+        UTC-aware datetime whose calendar date to query. Defaults to today (UTC).
+
+    Returns {ticker: row_dict}. Tickers with no row for that date are absent.
     """
     if not tickers:
         return {}
 
-    today_start = datetime.now(timezone.utc).replace(
+    base = (for_date or datetime.now(timezone.utc)).replace(
         hour=0, minute=0, second=0, microsecond=0
     )
+    if base.tzinfo is None:
+        base = base.replace(tzinfo=timezone.utc)
+    today_start = base
     today_end = today_start + timedelta(days=1)
 
     engine = get_engine()
@@ -603,6 +608,39 @@ def get_latest_price_bars(
     return result
 
 
+def get_latest_indicators(
+    tickers: list[str], interval: str = "1d"
+) -> dict[str, dict]:
+    """Return the most recent indicator row per ticker in a single query.
+
+    Uses DISTINCT ON so it always returns a result regardless of the bar date.
+    This is what the simulator uses — indicators are timestamped at the last
+    price bar (e.g. 2026-03-25 04:00 UTC) not at today's UTC calendar date,
+    so date-filtered get_todays_indicators() would return nothing for the same
+    calendar day the scan ran.
+
+    Returns {ticker: row_dict}. Absent tickers have no data in the DB.
+    """
+    if not tickers:
+        return {}
+
+    engine = get_engine()
+    query = text(
+        """
+        SELECT DISTINCT ON (ticker) *
+        FROM indicators
+        WHERE ticker = ANY(:tickers) AND interval = :interval
+        ORDER BY ticker, time DESC
+        """
+    )
+    df = pd.read_sql(
+        query, engine, params={"tickers": tickers, "interval": interval}
+    )
+    if df.empty:
+        return {}
+    return {row["ticker"]: row.to_dict() for _, row in df.iterrows()}
+
+
 def get_prev_indicators(
     tickers: list[str], interval: str = "1d"
 ) -> dict[str, dict]:
@@ -638,8 +676,15 @@ def get_prev_indicators(
 # Signals
 # ---------------------------------------------------------------------------
 
-def insert_signals(signals: list[dict]) -> list[int]:
+def insert_signals(signals: list[dict], signal_time=None) -> list[int]:
     """Bulk insert strategy signals. Returns list of inserted ids in input order.
+
+    Parameters
+    ----------
+    signal_time:
+        Optional UTC-aware datetime/Timestamp to use for the signal time.
+        When provided, anchors signals to the trading day they were derived from
+        rather than the wall-clock time. Defaults to datetime.now(timezone.utc).
 
     Phase 3 uses the returned ids to call mark_signal_acted_on() after
     executing a simulated trade.
@@ -647,7 +692,9 @@ def insert_signals(signals: list[dict]) -> list[int]:
     if not signals:
         return []
 
-    now = datetime.now(timezone.utc)
+    now = signal_time if signal_time is not None else datetime.now(timezone.utc)
+    if hasattr(now, 'to_pydatetime'):
+        now = now.to_pydatetime()
     rows = [
         (
             now,
@@ -681,15 +728,26 @@ def insert_signals(signals: list[dict]) -> list[int]:
             return [r[0] for r in result]
 
 
-def get_todays_signals(min_strength: Optional[float] = None) -> pd.DataFrame:
-    """Return today's signals ordered by strength descending.
+def get_todays_signals(
+    min_strength: Optional[float] = None,
+    for_date: Optional[datetime] = None,
+) -> pd.DataFrame:
+    """Return signals for a given date, ordered by strength descending.
+
+    Parameters
+    ----------
+    for_date:
+        UTC-aware datetime whose calendar date to query. Defaults to today (UTC).
 
     Always includes the 'id' column — Phase 3 uses it to call
     mark_signal_acted_on() after executing a simulated trade.
     """
-    today_start = datetime.now(timezone.utc).replace(
+    base = (for_date or datetime.now(timezone.utc)).replace(
         hour=0, minute=0, second=0, microsecond=0
     )
+    if base.tzinfo is None:
+        base = base.replace(tzinfo=timezone.utc)
+    today_start = base
     today_end = today_start + timedelta(days=1)
 
     engine = get_engine()
@@ -730,3 +788,361 @@ def get_open_position_tickers() -> list[str]:
     )
     with engine.connect() as conn:
         return [row[0] for row in conn.execute(query)]
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: open positions (full DataFrame)
+# ---------------------------------------------------------------------------
+
+def get_open_positions() -> pd.DataFrame:
+    """Return all currently open buy trades as a DataFrame.
+
+    Open = status='filled' AND side='buy'. This matches how insert_trade() creates
+    buy rows and how close_trade() sets status='closed'.
+
+    Different from get_open_position_tickers() — returns full row data.
+    Do NOT merge these two functions.
+    """
+    engine = get_engine()
+    query = text(
+        """
+        SELECT id, time, ticker, quantity, fill_price, stop_loss, take_profit,
+               signal_strength, strategy, reason, signal_data, status
+        FROM trades
+        WHERE side = 'buy' AND status = 'filled'
+        ORDER BY time DESC
+        """
+    )
+    df = pd.read_sql(query, engine, parse_dates=["time"])
+    if not df.empty:
+        df["time"] = pd.to_datetime(df["time"], utc=True)
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: trade execution
+# ---------------------------------------------------------------------------
+
+def insert_trade(
+    ticker: str,
+    side: str,
+    quantity: float,
+    fill_price: float,
+    stop_loss: Optional[float],
+    take_profit: Optional[float],
+    strategy: str,
+    signal_strength: Optional[float],
+    reason: str,
+    signal_data=None,
+    currency: str = "USD",
+    fx_rate: float = 1.0,
+) -> int:
+    """Insert a new trade row. Returns the new trade id.
+
+    Monetary values are rounded to 2 decimal places before storage.
+    currency: native currency of the asset (USD, CAD).
+    fx_rate: rate from native currency to portfolio base currency at fill time.
+    """
+    now = datetime.now(timezone.utc)
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO trades
+                    (time, ticker, side, quantity, fill_price, stop_loss, take_profit,
+                     signal_strength, strategy, reason, signal_data, status,
+                     currency, fx_rate)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'filled', %s, %s)
+                RETURNING id
+                """,
+                (
+                    now,
+                    ticker,
+                    side.lower(),
+                    quantity,
+                    round(float(fill_price), 2),
+                    round(float(stop_loss), 2) if stop_loss is not None else None,
+                    round(float(take_profit), 2) if take_profit is not None else None,
+                    float(signal_strength) if signal_strength is not None else None,
+                    strategy,
+                    reason,
+                    json.dumps(signal_data) if signal_data is not None and not isinstance(signal_data, str) else signal_data,
+                    currency,
+                    round(float(fx_rate), 6),
+                ),
+            )
+            row = cur.fetchone()
+            return row[0]
+
+
+def close_trade(ticker: str, exit_price: float, exit_reason: str) -> float:
+    """Close an open buy trade for ticker in a single transaction.
+
+    Actions (atomic):
+      1. Find the most recent open buy trade for *ticker* (status='filled', side='buy').
+      2. Insert a sell trade row with the same quantity, strategy, currency and fx_rate.
+      3. Mark the original buy trade status='closed'.
+
+    Returns
+    -------
+    float
+        Realised P&L = (exit_price - original_fill_price) * quantity.
+        Returns 0.0 if no open buy trade is found.
+    """
+    now = datetime.now(timezone.utc)
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            # Find most recent open buy trade
+            cur.execute(
+                """
+                SELECT id, quantity, fill_price, strategy, currency, fx_rate
+                FROM trades
+                WHERE ticker = %s AND side = 'buy' AND status = 'filled'
+                ORDER BY time DESC
+                LIMIT 1
+                """,
+                (ticker,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                logger.warning(f"close_trade: no open buy trade found for {ticker}")
+                return 0.0
+
+            orig_id, quantity, orig_fill, strategy, currency, fx_rate = row
+            realised_pnl = (float(exit_price) - float(orig_fill)) * float(quantity)
+
+            # Insert sell trade (carry currency + fx_rate from the buy)
+            cur.execute(
+                """
+                INSERT INTO trades
+                    (time, ticker, side, quantity, fill_price, stop_loss, take_profit,
+                     signal_strength, strategy, reason, signal_data, status,
+                     currency, fx_rate)
+                VALUES (%s, %s, 'sell', %s, %s, NULL, NULL, NULL, %s, %s, NULL, 'filled', %s, %s)
+                """,
+                (
+                    now,
+                    ticker,
+                    float(quantity),
+                    round(float(exit_price), 2),
+                    strategy,
+                    exit_reason,
+                    currency,
+                    float(fx_rate),
+                ),
+            )
+
+            # Mark original buy as closed
+            cur.execute(
+                "UPDATE trades SET status = 'closed' WHERE id = %s",
+                (orig_id,),
+            )
+
+    return realised_pnl
+
+
+def update_stop_loss(ticker: str, new_stop_loss: float) -> None:
+    """Update stop_loss on the most recent open buy trade for ticker."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE trades
+                SET stop_loss = %s
+                WHERE id = (
+                    SELECT id FROM trades
+                    WHERE ticker = %s AND side = 'buy' AND status = 'filled'
+                    ORDER BY time DESC
+                    LIMIT 1
+                )
+                """,
+                (round(float(new_stop_loss), 2), ticker),
+            )
+
+
+def mark_signal_acted_on(signal_id: int) -> None:
+    """Set acted_on=True for the given signal id."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE signals SET acted_on = TRUE WHERE id = %s",
+                (signal_id,),
+            )
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: analytics / reporting helpers
+# ---------------------------------------------------------------------------
+
+def get_trade_history(
+    ticker: Optional[str] = None,
+    strategy: Optional[str] = None,
+    limit: int = 100,
+) -> pd.DataFrame:
+    """Return recent trades, optionally filtered by ticker and/or strategy.
+
+    Parameters
+    ----------
+    ticker:
+        If set, only return trades for this ticker.
+    strategy:
+        If set, only return trades for this strategy.
+    limit:
+        Maximum rows to return (default 100).
+    """
+    engine = get_engine()
+    conditions = []
+    params: dict = {"limit": limit}
+
+    if ticker:
+        conditions.append("ticker = :ticker")
+        params["ticker"] = ticker
+    if strategy:
+        conditions.append("strategy = :strategy")
+        params["strategy"] = strategy
+
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    query = text(
+        f"SELECT * FROM trades {where} ORDER BY time DESC LIMIT :limit"
+    )
+    df = pd.read_sql(query, engine, params=params, parse_dates=["time"])
+    if not df.empty:
+        df["time"] = pd.to_datetime(df["time"], utc=True)
+    return df
+
+
+def get_portfolio_stats() -> dict:
+    """Return aggregate trade performance stats.
+
+    Returns
+    -------
+    dict with keys:
+        total_trades, winning_trades, win_rate, avg_win, avg_loss, total_pnl
+    """
+    engine = get_engine()
+    # Join buy and sell trades to compute per-trade PnL
+    query = text(
+        """
+        SELECT
+            buy.ticker,
+            buy.quantity,
+            buy.fill_price                         AS buy_price,
+            sell.fill_price                        AS sell_price,
+            (sell.fill_price - buy.fill_price) * buy.quantity AS pnl
+        FROM trades buy
+        JOIN trades sell
+          ON sell.ticker = buy.ticker
+         AND sell.side   = 'sell'
+         AND sell.strategy = buy.strategy
+        WHERE buy.side = 'buy'
+          AND buy.status = 'closed'
+        """
+    )
+    df = pd.read_sql(query, engine)
+
+    if df.empty:
+        return {
+            "total_trades":   0,
+            "winning_trades": 0,
+            "win_rate":       0.0,
+            "avg_win":        0.0,
+            "avg_loss":       0.0,
+            "total_pnl":      0.0,
+        }
+
+    total  = len(df)
+    wins   = df[df["pnl"] > 0]
+    losses = df[df["pnl"] <= 0]
+    return {
+        "total_trades":   total,
+        "winning_trades": len(wins),
+        "win_rate":       round(len(wins) / total, 4) if total > 0 else 0.0,
+        "avg_win":        round(wins["pnl"].mean(), 2) if not wins.empty else 0.0,
+        "avg_loss":       round(losses["pnl"].mean(), 2) if not losses.empty else 0.0,
+        "total_pnl":      round(df["pnl"].sum(), 2),
+    }
+
+
+def get_latest_atr(ticker: str) -> Optional[float]:
+    """Return the most recent atr_14 value for a ticker from the indicators table.
+
+    Returns None if no row exists or atr_14 is NULL.
+    """
+    engine = get_engine()
+    query = text(
+        """
+        SELECT atr_14 FROM indicators
+        WHERE ticker = :ticker AND interval = '1d'
+        ORDER BY time DESC
+        LIMIT 1
+        """
+    )
+    with engine.connect() as conn:
+        val = conn.execute(query, {"ticker": ticker}).scalar()
+    return float(val) if val is not None else None
+
+
+def get_sector_map() -> dict[str, str]:
+    """Return {ticker: sector} for all active watchlist tickers in one query.
+
+    Used by simulator.py to pass sector context to executor without executor
+    querying the DB directly. Unknown/NULL sectors become 'Unknown'.
+    """
+    engine = get_engine()
+    query = text("SELECT ticker, sector FROM watchlist WHERE active = TRUE")
+    with engine.connect() as conn:
+        rows = conn.execute(query).fetchall()
+    return {row[0]: (row[1] if row[1] else "Unknown") for row in rows}
+
+
+def get_market_map() -> dict[str, str]:
+    """Return {ticker: market} for all active watchlist tickers.
+
+    market is 'US' or 'CA'. Used to determine native currency for each ticker.
+    """
+    engine = get_engine()
+    query = text("SELECT ticker, market FROM watchlist WHERE active = TRUE")
+    with engine.connect() as conn:
+        rows = conn.execute(query).fetchall()
+    return {row[0]: (row[1] if row[1] else "US") for row in rows}
+
+
+def get_peak_portfolio_value() -> float:
+    """Return the historical maximum total_value from portfolio_snapshots.
+
+    Falls back to INITIAL_CAPITAL (.env) if no snapshots exist yet.
+    Used by Portfolio.load_from_db() to restore peak_value on restart.
+    """
+    initial = float(os.environ.get("INITIAL_CAPITAL", 100_000.0))
+    engine = get_engine()
+    query = text("SELECT MAX(total_value) FROM portfolio_snapshots")
+    with engine.connect() as conn:
+        val = conn.execute(query).scalar()
+    return float(val) if val is not None else initial
+
+
+def get_latest_close_prices(tickers: list[str]) -> dict[str, float]:
+    """Return the most recent closing price per ticker from price_data.
+
+    Reads from the DB only — no yfinance call. The 5:00 PM data fetch writes
+    today's close to price_data, so this is safe to call at 5:25 PM ET.
+    Used by run_evening() so it never makes a live network request.
+
+    Returns {ticker: close_price} for all requested tickers that have data.
+    Tickers with no rows in price_data are simply absent from the result.
+    """
+    if not tickers:
+        return {}
+
+    engine = get_engine()
+    query = text(
+        """
+        SELECT DISTINCT ON (ticker) ticker, close
+        FROM price_data
+        WHERE ticker = ANY(:tickers)
+        ORDER BY ticker, time DESC
+        """
+    )
+    with engine.connect() as conn:
+        rows = conn.execute(query, {"tickers": tickers}).fetchall()
+    return {row[0]: float(row[1]) for row in rows}

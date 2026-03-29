@@ -39,6 +39,18 @@ import pandas as pd
 import requests
 from loguru import logger
 
+try:
+    from rich.progress import (
+        BarColumn,
+        Progress,
+        SpinnerColumn,
+        TextColumn,
+        TimeElapsedColumn,
+    )
+    _RICH_AVAILABLE = True
+except ImportError:
+    _RICH_AVAILABLE = False
+
 _HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -203,17 +215,57 @@ _TICKER_BLACKLIST: set[str] = {
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    _setup_steps = [
+        "Docker check",
+        "Start DB + wait for ready",
+        "Copy .env",
+        "Fetch S&P 500",
+        "Fetch TSX 60 + extras",
+        "Seed watchlist",
+        "Backfill OHLCV data",
+    ]
+
+    if _RICH_AVAILABLE:
+        _progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("{task.completed}/{task.total}"),
+            TimeElapsedColumn(),
+        )
+        _task = _progress.add_task("Setup...", total=len(_setup_steps))
+        _progress.start()
+
+        def _step(label: str) -> None:
+            _progress.update(_task, description=f"[cyan]{label}[/cyan]")
+
+        def _done() -> None:
+            _progress.advance(_task)
+    else:
+        def _step(label: str) -> None:
+            logger.info(label)
+
+        def _done() -> None:
+            pass
+
     # Step 2: Docker check
+    _step("Checking Docker daemon")
     if not _check_docker():
+        if _RICH_AVAILABLE:
+            _progress.stop()
         logger.error("Docker is not running. Start Docker Desktop and try again.")
         sys.exit(1)
     logger.info("Docker daemon is running.")
+    _done()
 
     # Step 3: Start DB + wait
+    _step("Starting TimescaleDB + waiting for ready")
     _start_db()
     _wait_for_db()
+    _done()
 
     # Step 4: Copy .env.example → .env
+    _step("Copying .env")
     _dir        = os.path.dirname(os.path.abspath(__file__))
     env_path    = os.path.join(_dir, ".env")
     env_example = os.path.join(_dir, ".env.example")
@@ -223,17 +275,21 @@ def main() -> None:
         logger.info(f"Created backend/.env from .env.example")
     else:
         logger.info("backend/.env already exists — skipping copy")
+    _done()
 
     # Steps 5 & 6: Fetch watchlist from Wikipedia
     tickers: list[dict] = []
 
+    _step("Fetching S&P 500 from Wikipedia")
     try:
         sp500 = _fetch_sp500()
         logger.info(f"S&P 500: {len(sp500)} tickers fetched")
         tickers.extend(sp500)
     except Exception as exc:
         logger.error(f"Failed to fetch S&P 500 from Wikipedia: {exc}")
+    _done()
 
+    _step("Fetching TSX 60 + extra tickers")
     try:
         tsx60 = _fetch_tsx60()
         logger.info(f"TSX 60: {len(tsx60)} tickers fetched")
@@ -255,14 +311,22 @@ def main() -> None:
         logger.info(f"Blacklist removed {removed} ticker(s): {_TICKER_BLACKLIST & {t['ticker'] for t in tickers} ^ _TICKER_BLACKLIST}")
 
     if not tickers:
+        if _RICH_AVAILABLE:
+            _progress.stop()
         logger.error("No tickers were fetched — cannot seed watchlist. Aborting.")
         sys.exit(1)
+    _done()
 
     # Step 7: Seed watchlist
+    _step("Seeding watchlist")
     seed_watchlist(tickers)
     logger.info(f"Watchlist seeded with {len(tickers)} tickers")
+    _done()
 
     # Step 8: Fetch only missing/new bars (skips tickers that are already up-to-date)
+    _step("Backfilling OHLCV data (this will take a while…)")
+    if _RICH_AVAILABLE:
+        _progress.stop()  # stop the step bar so update_all's own bar renders cleanly
     logger.info("Fetching missing OHLCV data (~2015-present). Already-fetched tickers are skipped...")
     update_all(interval="1d")
 

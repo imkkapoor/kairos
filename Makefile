@@ -2,7 +2,7 @@ VENV   := backend/.venv
 PYTHON := $(VENV)/bin/python
 PIP    := $(VENV)/bin/pip
 
-.PHONY: install up down logs setup run scan fetch retry-failed shell-db reset-db help \
+.PHONY: install up down logs setup run scan fetch retry-failed simulate simulate-evening shell-db reset-db help \
         _guard-docker _guard-venv
 
 ## install: Create .venv, upgrade pip, install all requirements
@@ -39,6 +39,14 @@ run: _guard-docker _guard-venv
 ## scan: Run the daily signal scan once right now (skips schedule)
 scan: _guard-docker _guard-venv
 	$(PYTHON) -c "import sys; sys.path.insert(0, 'backend'); from strategies.scanner import run_daily_scan; run_daily_scan()"
+
+## simulate: Run morning execution now (uses last weekday's signals + live prices)
+simulate: _guard-docker _guard-venv
+	cd backend && $(abspath $(PYTHON)) -m simulator.simulator morning
+
+## simulate-evening: Run evening position management now (uses DB close prices)
+simulate-evening: _guard-docker _guard-venv
+	cd backend && $(abspath $(PYTHON)) -m simulator.simulator evening
 
 ## fetch: Incremental update for all active watchlist tickers
 fetch:

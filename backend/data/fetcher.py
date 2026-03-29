@@ -41,7 +41,7 @@ try:
 except ImportError:
     _RICH_AVAILABLE = False
 
-_RATE_DELAY = 1.0          # seconds between successive ticker downloads
+_RATE_DELAY = 0         # seconds between successive ticker downloads
 _BACKOFF    = [2, 4, 8]    # retry wait times in seconds
 
 
@@ -173,9 +173,9 @@ def backfill(ticker: str, interval: str = "1d", years: int = 10) -> dict:
     today      = datetime.now(timezone.utc).date()
     start_date = today - timedelta(days=years * 365)
     start      = start_date.isoformat()
-    end        = today.isoformat()
+    end        = (today + timedelta(days=1)).isoformat()  # yfinance end is exclusive
 
-    logger.info(f"[{ticker}] backfill {start} → {end} ({interval})")
+    logger.info(f"[{ticker}] backfill {start} → {today} ({interval})")
 
     df = _fetch_with_retry(ticker, start=start, end=end, interval=interval)
     df = _normalise(df, ticker)
@@ -224,14 +224,17 @@ def update(ticker: str, interval: str = "1d") -> dict:
         return {"status": "skipped", "rows": 0, "ticker": ticker}
 
     start = start_date.isoformat()
-    end   = today.isoformat()
+    end   = (today + timedelta(days=1)).isoformat()  # yfinance end is exclusive
 
-    logger.info(f"[{ticker}] update {start} → {end} ({interval})")
+    logger.info(f"[{ticker}] update {start} → {today} ({interval})")
 
     df = _fetch_with_retry(ticker, start=start, end=end, interval=interval)
     df = _normalise(df, ticker)
 
     if df.empty:
+        if start_date >= today:
+            logger.debug(f"[{ticker}] no new daily bar yet (market may still be open)")
+            return {"status": "skipped", "rows": 0, "ticker": ticker}
         logger.warning(f"[{ticker}] empty DataFrame after fetch/normalise")
         return {"status": "error", "rows": 0, "ticker": ticker}
 
@@ -299,7 +302,6 @@ def backfill_all(interval: str = "1d", years: int = 10) -> None:
 
     duration = _time.monotonic() - t_start
     log_daily_fetch(
-        date            = _time.strftime("%Y-%m-%d", _time.gmtime()),
         tickers_total   = len(tickers),
         tickers_success = n_success,
         tickers_skipped = n_skipped,
@@ -334,7 +336,8 @@ def update_all(interval: str = "1d") -> int:
     n_success = n_skipped = n_failed = n_rows = 0
     failed_list: list[str] = []
 
-    for ticker in tickers:
+    def _run_update(ticker: str) -> None:
+        nonlocal n_success, n_skipped, n_failed, n_rows
         try:
             result = update(ticker, interval)
         except Exception as exc:
@@ -348,11 +351,29 @@ def update_all(interval: str = "1d") -> int:
         else:
             n_failed += 1
             failed_list.append(ticker)
-        _time.sleep(_RATE_DELAY)
+
+    if _RICH_AVAILABLE:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("{task.completed}/{task.total}"),
+            TimeElapsedColumn(),
+        ) as progress:
+            task = progress.add_task("Updating...", total=len(tickers))
+            for ticker in tickers:
+                progress.update(task, description=f"[cyan]{ticker}[/cyan]")
+                _run_update(ticker)
+                _time.sleep(_RATE_DELAY)
+                progress.advance(task)
+    else:
+        for i, ticker in enumerate(tickers, 1):
+            logger.info(f"[{i}/{len(tickers)}] {ticker}")
+            _run_update(ticker)
+            _time.sleep(_RATE_DELAY)
 
     duration = _time.monotonic() - t_start
     log_daily_fetch(
-        date            = _time.strftime("%Y-%m-%d", _time.gmtime()),
         tickers_total   = len(tickers),
         tickers_success = n_success,
         tickers_skipped = n_skipped,
@@ -398,8 +419,8 @@ def retry_failed(date_str: str | None = None, interval: str = "1d") -> None:
         logger.warning("fetch_log is empty — nothing to retry")
         return
 
-    # Normalise date column to plain strings for comparison
-    row = df[df["date"].astype(str).str.startswith(date_str)]
+    # Find rows whose fetch_time falls on the requested calendar date (UTC)
+    row = df[df["fetch_time"].dt.date.astype(str) == date_str]
     if row.empty:
         logger.warning(f"No fetch_log entry found for {date_str}")
         return
@@ -436,10 +457,9 @@ def retry_failed(date_str: str | None = None, interval: str = "1d") -> None:
 
     duration = _time.monotonic() - t_start
 
-    # Update the fetch_log row for this date with revised counts
+    # Append a new log row summarising the retry run
     original = row.iloc[0]
     log_daily_fetch(
-        date            = date_str,
         tickers_total   = int(original["tickers_total"]),
         tickers_success = int(original["tickers_success"]) + n_success,
         tickers_skipped = int(original["tickers_skipped"]),

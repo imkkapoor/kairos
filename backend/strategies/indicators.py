@@ -24,6 +24,18 @@ import pandas as pd
 import pandas_ta as ta
 from loguru import logger
 
+try:
+    from rich.progress import (
+        BarColumn,
+        Progress,
+        SpinnerColumn,
+        TextColumn,
+        TimeElapsedColumn,
+    )
+    _RICH_AVAILABLE = True
+except ImportError:
+    _RICH_AVAILABLE = False
+
 _BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _BACKEND_DIR not in sys.path:
     sys.path.insert(0, _BACKEND_DIR)
@@ -82,6 +94,8 @@ def _compute_row(df: pd.DataFrame, ticker: str) -> dict | None:
     atr    = ta.atr(high, low, close, length=14)
     adx_df = ta.adx(high, low, close, length=14)
     vsma   = ta.sma(volume, length=20)
+    macd_df = ta.macd(close, fast=12, slow=26, signal=9)
+    roc    = ta.roc(close, length=20)
 
     # -- Extract last-row scalar values --
     def last_val(s) -> float | None:
@@ -96,6 +110,20 @@ def _compute_row(df: pd.DataFrame, ticker: str) -> dict | None:
     ema20_val  = last_val(ema20)
     atr_val    = last_val(atr)
     vsma_val   = last_val(vsma)
+    roc_val    = last_val(roc)
+
+    # -- MACD (find columns by prefix — robust across minor versions) --
+    macd_line_val = macd_signal_val = macd_hist_val = None
+    if macd_df is not None and not macd_df.empty:
+        macd_col = _find_col(macd_df, "MACD_")
+        macds_col = _find_col(macd_df, "MACDs_")
+        macdh_col = _find_col(macd_df, "MACDh_")
+        if macd_col:
+            macd_line_val = float(macd_df[macd_col].iloc[-1])
+        if macds_col:
+            macd_signal_val = float(macd_df[macds_col].iloc[-1])
+        if macdh_col:
+            macd_hist_val = float(macd_df[macdh_col].iloc[-1])
 
     # -- Bollinger Bands (find columns by prefix — robust across minor versions) --
     bb_upper = bb_mid = bb_lower = None
@@ -118,16 +146,20 @@ def _compute_row(df: pd.DataFrame, ticker: str) -> dict | None:
             adx_val = float(adx_df[adx_col].iloc[-1])
 
     values: dict = {
-        "rsi_14":    rsi_val,
-        "ma_50":     sma50_val,
-        "ma_200":    sma200_val,
-        "ema_20":    ema20_val,
-        "bb_upper":  bb_upper,
-        "bb_mid":    bb_mid,
-        "bb_lower":  bb_lower,
-        "atr_14":    atr_val,
-        "adx_14":    adx_val,
-        "volume_sma": vsma_val,
+        "rsi_14":      rsi_val,
+        "ma_50":       sma50_val,
+        "ma_200":      sma200_val,
+        "ema_20":      ema20_val,
+        "bb_upper":    bb_upper,
+        "bb_mid":      bb_mid,
+        "bb_lower":    bb_lower,
+        "atr_14":      atr_val,
+        "adx_14":      adx_val,
+        "volume_sma":  vsma_val,
+        "macd_line":   macd_line_val,
+        "macd_signal": macd_signal_val,
+        "macd_hist":   macd_hist_val,
+        "roc_20":      roc_val,
     }
 
     # Reject the row only if a *critical* indicator is NaN.
@@ -168,7 +200,21 @@ def compute_all(interval: str = "1d") -> dict[str, dict]:
       - Any required indicator evaluates to NaN after computation
     """
     tickers = get_watchlist(active_only=True)
-    existing_today = get_todays_indicators(tickers, interval=interval)
+
+    # Determine the latest trading day from actual price data so the cache
+    # lookup matches indicator timestamps (which inherit the price bar time,
+    # e.g. 2026-03-25 04:00 UTC) rather than today's UTC calendar date.
+    _latest_bar_time = None
+    try:
+        _spy_bar = get_price_data("SPY", interval=interval, limit=1)
+        if not _spy_bar.empty:
+            _latest_bar_time = _spy_bar.index[-1]  # UTC-aware pd.Timestamp
+    except Exception:
+        pass
+
+    existing_today = get_todays_indicators(
+        tickers, interval=interval, for_date=_latest_bar_time,
+    )
     to_compute     = [t for t in tickers if t not in existing_today]
 
     # Bulk-fetch latest close/volume for already-computed tickers (single query)
@@ -187,7 +233,8 @@ def compute_all(interval: str = "1d") -> dict[str, dict]:
     computed   = 0
     skipped    = 0
 
-    for ticker in to_compute:
+    def _process_ticker(ticker: str) -> None:
+        nonlocal computed, skipped
         try:
             df = get_price_data(ticker, interval=interval, start=start_dt)
             df = df.tail(250)
@@ -197,12 +244,12 @@ def compute_all(interval: str = "1d") -> dict[str, dict]:
                     f"[{ticker}] only {len(df)} rows (min {_MIN_ROWS} required) — skipping"
                 )
                 skipped += 1
-                continue
+                return
 
             row = _compute_row(df, ticker)
             if row is None:
                 skipped += 1
-                continue
+                return
 
             insert_indicator_row(ticker, interval, row)
             results[ticker] = row
@@ -211,6 +258,23 @@ def compute_all(interval: str = "1d") -> dict[str, dict]:
         except Exception as exc:
             logger.error(f"[{ticker}] indicator computation error: {exc}")
             skipped += 1
+
+    if _RICH_AVAILABLE and to_compute:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("{task.completed}/{task.total}"),
+            TimeElapsedColumn(),
+        ) as progress:
+            task = progress.add_task("Computing indicators...", total=len(to_compute))
+            for ticker in to_compute:
+                progress.update(task, description=f"[cyan]{ticker}[/cyan]")
+                _process_ticker(ticker)
+                progress.advance(task)
+    else:
+        for ticker in to_compute:
+            _process_ticker(ticker)
 
     logger.info(
         f"compute_all: {computed} computed, {len(existing_today)} from DB cache, "

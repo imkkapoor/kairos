@@ -39,6 +39,10 @@ CREATE TABLE IF NOT EXISTS indicators (
     atr_14     DOUBLE PRECISION,   -- Required by Phase 3 position sizing
     adx_14     DOUBLE PRECISION,   -- Required by Phase 2 regime detection
     volume_sma DOUBLE PRECISION,
+    macd_line  DOUBLE PRECISION,   -- MACD line (Phase 2)
+    macd_signal DOUBLE PRECISION,  -- MACD signal line (Phase 2)
+    macd_hist  DOUBLE PRECISION,   -- MACD histogram (Phase 2)
+    roc_20     DOUBLE PRECISION,   -- Rate of change 20-period (Phase 2)
     UNIQUE (time, ticker, interval)
 );
 
@@ -78,7 +82,9 @@ CREATE TABLE IF NOT EXISTS trades (
     strategy        TEXT             NOT NULL,
     reason          TEXT             NOT NULL,
     signal_data     JSONB,
-    status          TEXT             NOT NULL DEFAULT 'filled'
+    status          TEXT             NOT NULL DEFAULT 'filled',
+    currency        TEXT             NOT NULL DEFAULT 'USD',   -- Native currency of the asset
+    fx_rate         DOUBLE PRECISION NOT NULL DEFAULT 1.0      -- FX rate to portfolio currency at fill time
 );
 
 -- ---------------------------------------------------------------------------
@@ -91,7 +97,8 @@ CREATE TABLE IF NOT EXISTS portfolio_snapshots (
     positions   JSONB            NOT NULL,  -- Full position context for Phase 3
     daily_pnl   DOUBLE PRECISION,
     total_pnl   DOUBLE PRECISION,
-    drawdown    DOUBLE PRECISION
+    drawdown    DOUBLE PRECISION,
+    currency    TEXT             NOT NULL DEFAULT 'CAD'  -- Portfolio base currency
 );
 
 SELECT create_hypertable('portfolio_snapshots', 'time', if_not_exists => TRUE);
@@ -110,11 +117,10 @@ CREATE TABLE IF NOT EXISTS watchlist (
 );
 
 -- ---------------------------------------------------------------------------
--- fetch_log: one row per calendar day summarising the full fetch run
+-- fetch_log: one row per fetch run summarising what happened
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS fetch_log (
     id              SERIAL PRIMARY KEY,
-    date            DATE NOT NULL,
     tickers_total   INTEGER NOT NULL,
     tickers_success INTEGER NOT NULL,
     tickers_skipped INTEGER NOT NULL,
@@ -123,6 +129,5 @@ CREATE TABLE IF NOT EXISTS fetch_log (
     rows_inserted   INTEGER NOT NULL,
     duration_secs   DOUBLE PRECISION,
     notes           TEXT,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT fetch_log_date_unique UNIQUE (date)
+    fetch_time      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );

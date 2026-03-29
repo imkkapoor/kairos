@@ -118,12 +118,24 @@ def generate_signals(
                 if ticker not in open_set:
                     base   = min(gap_pct, 1.0)
                     final  = min(base * rmult * rconf * vmult, 1.0)
+                    roc = row.get('roc_20')
+                    roc_str = ""
+                    if roc is not None:
+                        roc = float(roc)
+                        if roc > 10:
+                            final = min(final + 0.10, 1.0)
+                        elif roc > 5:
+                            final = min(final + 0.05, 1.0)
+                        elif roc < -5:
+                            final = max(final - 0.05, 0.0)
+                        roc_str = f", ROC={roc:.1f}%"
                     reason = (
                         f"Golden cross: ma50={ma50:.2f}>ma200={ma200:.2f} "
                         f"(prev ma50={prev_ma50:.2f}<=ma200={prev_ma200:.2f}), "
                         f"gap={gap_pct:.2f}%, "
                         f"regime={reg['regime']}(conf={rconf:.2f}), "
                         f"vol_mult={vmult:.2f}"
+                        f"{roc_str}"
                     )
                     signals.append({
                         "ticker":      ticker,
@@ -174,11 +186,23 @@ def generate_signals(
         ):
             base   = min(adx_f / 40, 0.5)
             final  = min(base * rmult * rconf * vmult, 1.0)
+            roc = row.get('roc_20')
+            roc_str = ""
+            if roc is not None:
+                roc = float(roc)
+                if roc > 10:
+                    final = min(final + 0.10, 1.0)
+                elif roc > 5:
+                    final = min(final + 0.05, 1.0)
+                elif roc < -5:
+                    final = max(final - 0.05, 0.0)
+                roc_str = f", ROC={roc:.1f}%"
             reason = (
                 f"Trend continuation: close={close:.2f}>ma50={ma50:.2f}>ma200={ma200:.2f}, "
                 f"ADX={adx_f:.1f}, "
                 f"regime={reg['regime']}(conf={rconf:.2f}), "
                 f"vol_mult={vmult:.2f}"
+                f"{roc_str}"
             )
             signals.append({
                 "ticker":      ticker,
