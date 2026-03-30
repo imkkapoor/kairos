@@ -292,6 +292,7 @@ class Portfolio:
         current_prices: dict,
         fx_rates: dict | None = None,
         market_map: dict | None = None,
+        snapshot_time=None,
     ) -> None:
         """Compute portfolio metrics and write a snapshot to the DB."""
         from db.connection import save_portfolio_snapshot
@@ -308,6 +309,7 @@ class Portfolio:
             total_pnl=round(total_pnl, 2),
             drawdown=round(drawdown, 6),
             currency=self.currency,
+            snapshot_time=snapshot_time,
         )
         logger.debug(
             f"Snapshot saved: total=${total_value:,.2f} "

@@ -131,3 +131,33 @@ CREATE TABLE IF NOT EXISTS fetch_log (
     notes           TEXT,
     fetch_time      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- ---------------------------------------------------------------------------
+-- backtest_results: per-ticker strategy performance metrics
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS backtest_results (
+    id             SERIAL PRIMARY KEY,
+    run_at         TIMESTAMPTZ      NOT NULL DEFAULT NOW(),
+    strategy       TEXT             NOT NULL,
+    ticker         TEXT,
+    period         TEXT             NOT NULL,  -- 'in_sample' | 'out_of_sample' | 'full'
+    mode           TEXT             NOT NULL DEFAULT 'single_ticker',  -- 'single_ticker' | 'portfolio'
+    start_date     TEXT             NOT NULL,
+    end_date       TEXT             NOT NULL,
+    total_trades   INTEGER,
+    win_rate       DOUBLE PRECISION,
+    avg_win        DOUBLE PRECISION,
+    avg_loss       DOUBLE PRECISION,
+    profit_factor  DOUBLE PRECISION,
+    cagr           DOUBLE PRECISION,
+    sharpe_ratio   DOUBLE PRECISION,
+    calmar_ratio   DOUBLE PRECISION,
+    max_drawdown   DOUBLE PRECISION,
+    final_value    DOUBLE PRECISION,
+    total_pnl      DOUBLE PRECISION,
+    params         JSONB,
+    notes          TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_backtest_strategy
+    ON backtest_results (strategy, period, mode);

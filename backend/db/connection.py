@@ -399,6 +399,7 @@ def save_portfolio_snapshot(
     total_pnl: Optional[float] = None,
     drawdown: Optional[float] = None,
     currency: str = "CAD",
+    snapshot_time: Optional[datetime] = None,
 ) -> None:
     """Persist a point-in-time portfolio snapshot.
 
@@ -418,25 +419,47 @@ def save_portfolio_snapshot(
         Current drawdown as a fraction of peak value (can be None).
     currency:
         Portfolio base currency code (default 'CAD').
+    snapshot_time:
+        Optional UTC datetime for the snapshot (defaults to now via DB DEFAULT).
+        Pass the historical fill date when committing a replay.
     """
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO portfolio_snapshots
-                    (cash, total_value, positions, daily_pnl, total_pnl, drawdown, currency)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-                """,
-                (
-                    cash,
-                    total_value,
-                    json.dumps(positions),
-                    daily_pnl,
-                    total_pnl,
-                    drawdown,
-                    currency,
-                ),
-            )
+            if snapshot_time is not None:
+                cur.execute(
+                    """
+                    INSERT INTO portfolio_snapshots
+                        (time, cash, total_value, positions, daily_pnl, total_pnl, drawdown, currency)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        snapshot_time,
+                        cash,
+                        total_value,
+                        json.dumps(positions),
+                        daily_pnl,
+                        total_pnl,
+                        drawdown,
+                        currency,
+                    ),
+                )
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO portfolio_snapshots
+                        (cash, total_value, positions, daily_pnl, total_pnl, drawdown, currency)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        cash,
+                        total_value,
+                        json.dumps(positions),
+                        daily_pnl,
+                        total_pnl,
+                        drawdown,
+                        currency,
+                    ),
+                )
 
 
 def get_latest_snapshot() -> Optional[dict]:
@@ -836,14 +859,17 @@ def insert_trade(
     signal_data=None,
     currency: str = "USD",
     fx_rate: float = 1.0,
+    trade_time: Optional[datetime] = None,
 ) -> int:
     """Insert a new trade row. Returns the new trade id.
 
     Monetary values are rounded to 2 decimal places before storage.
     currency: native currency of the asset (USD, CAD).
     fx_rate: rate from native currency to portfolio base currency at fill time.
+    trade_time: optional UTC datetime to stamp the trade (defaults to now).
+                Pass the historical fill date when committing a replay.
     """
-    now = datetime.now(timezone.utc)
+    now = trade_time if trade_time is not None else datetime.now(timezone.utc)
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -1146,3 +1172,176 @@ def get_latest_close_prices(tickers: list[str]) -> dict[str, float]:
     with engine.connect() as conn:
         rows = conn.execute(query, {"tickers": tickers}).fetchall()
     return {row[0]: float(row[1]) for row in rows}
+
+
+def get_next_day_open_prices(
+    tickers: list[str],
+    after_date: datetime,
+    interval: str = "1d",
+) -> tuple[dict[str, float], Optional[str]]:
+    """Return the opening price for each ticker on the next trading day after after_date.
+
+    Queries price_data for the earliest bar date that is strictly after
+    after_date (handles weekends and holidays automatically via DB contents).
+    Used by run_morning_replay() as the 9:31 AM fill price.
+
+    Returns
+    -------
+    (prices, trading_day_str)
+        prices: {ticker: open_price} for tickers with data on that day.
+        trading_day_str: the ISO date string of the fill day, or None if no data.
+    """
+    if not tickers:
+        return {}, None
+
+    search_start = after_date.replace(hour=0, minute=0, second=0, microsecond=0)
+    if search_start.tzinfo is None:
+        search_start = search_start.replace(tzinfo=timezone.utc)
+    # Add 1 day to exclude the signal date itself
+    search_start = search_start + timedelta(days=1)
+
+    engine = get_engine()
+
+    # Find the next available trading day in the DB
+    next_day_query = text(
+        """
+        SELECT MIN(time::date) AS trading_day
+        FROM price_data
+        WHERE ticker = ANY(:tickers)
+          AND interval  = :interval
+          AND time >= :search_start
+        """
+    )
+    with engine.connect() as conn:
+        trading_day = conn.execute(
+            next_day_query,
+            {"tickers": tickers, "interval": interval, "search_start": search_start},
+        ).scalar()
+
+    if trading_day is None:
+        return {}, None
+
+    day_start = datetime(trading_day.year, trading_day.month, trading_day.day, tzinfo=timezone.utc)
+    day_end   = day_start + timedelta(days=1)
+
+    price_query = text(
+        """
+        SELECT DISTINCT ON (ticker) ticker, open
+        FROM price_data
+        WHERE ticker = ANY(:tickers)
+          AND interval  = :interval
+          AND time >= :day_start
+          AND time <  :day_end
+        ORDER BY ticker, time ASC
+        """
+    )
+    with engine.connect() as conn:
+        rows = conn.execute(
+            price_query,
+            {"tickers": tickers, "interval": interval, "day_start": day_start, "day_end": day_end},
+        ).fetchall()
+
+    prices = {row[0]: float(row[1]) for row in rows}
+    return prices, trading_day.isoformat()
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: backtest results
+# ---------------------------------------------------------------------------
+
+def insert_backtest_result(result: dict) -> int:
+    """Insert one row into backtest_results. Return the new row id.
+
+    Parameters
+    ----------
+    result:
+        Dict with keys matching the backtest_results columns:
+        strategy, ticker, period, mode, start_date, end_date, total_trades,
+        win_rate, avg_win, avg_loss, profit_factor, cagr, sharpe_ratio,
+        calmar_ratio, max_drawdown, final_value, total_pnl, params, notes.
+        mode defaults to 'single_ticker' if not provided.
+    """
+    now = datetime.now(timezone.utc)
+    params_json = json.dumps(result["params"]) if result.get("params") else None
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO backtest_results
+                    (run_at, strategy, ticker, period, mode, start_date, end_date,
+                     total_trades, win_rate, avg_win, avg_loss, profit_factor,
+                     cagr, sharpe_ratio, calmar_ratio, max_drawdown,
+                     final_value, total_pnl, params, notes)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+                """,
+                (
+                    now,
+                    result["strategy"],
+                    result.get("ticker"),
+                    result["period"],
+                    result.get("mode", "single_ticker"),
+                    result["start_date"],
+                    result["end_date"],
+                    result["total_trades"],
+                    result.get("win_rate"),
+                    result.get("avg_win"),
+                    result.get("avg_loss"),
+                    result.get("profit_factor"),
+                    result.get("cagr"),
+                    result.get("sharpe_ratio"),
+                    result.get("calmar_ratio"),
+                    result.get("max_drawdown"),
+                    result.get("final_value"),
+                    result.get("total_pnl"),
+                    params_json,
+                    result.get("notes"),
+                ),
+            )
+            row = cur.fetchone()
+            return row[0]
+
+
+def get_backtest_results(
+    strategy: Optional[str] = None,
+    period: Optional[str] = None,
+) -> pd.DataFrame:
+    """Query backtest_results with optional filters. ORDER BY run_at DESC."""
+    engine = get_engine()
+    conditions = []
+    params: dict = {}
+
+    if strategy:
+        conditions.append("strategy = :strategy")
+        params["strategy"] = strategy
+    if period:
+        conditions.append("period = :period")
+        params["period"] = period
+
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    query = text(f"SELECT * FROM backtest_results {where} ORDER BY run_at DESC")
+    return pd.read_sql(query, engine, params=params, parse_dates=["run_at"])
+
+
+def get_best_strategies(period: str = "out_of_sample") -> pd.DataFrame:
+    """Return strategy summary: average metrics grouped by strategy.
+
+    This is the summary table — shows which strategy wins on out-of-sample data.
+    """
+    engine = get_engine()
+    query = text(
+        """
+        SELECT strategy,
+               AVG(sharpe_ratio) AS avg_sharpe,
+               AVG(calmar_ratio) AS avg_calmar,
+               AVG(win_rate) AS avg_win_rate,
+               AVG(max_drawdown) AS avg_max_drawdown,
+               COUNT(*) AS tickers_tested
+        FROM backtest_results
+        WHERE period = :period AND ticker IS NOT NULL
+        GROUP BY strategy
+        ORDER BY AVG(sharpe_ratio) DESC
+        """
+    )
+    return pd.read_sql(query, engine, params={"period": period})

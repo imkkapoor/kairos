@@ -3,6 +3,7 @@ PYTHON := $(VENV)/bin/python
 PIP    := $(VENV)/bin/pip
 
 .PHONY: install up down logs setup run scan fetch retry-failed simulate simulate-evening shell-db reset-db help \
+        backtest backtest-single hydrate-indicators \
         _guard-docker _guard-venv
 
 ## install: Create .venv, upgrade pip, install all requirements
@@ -40,9 +41,10 @@ run: _guard-docker _guard-venv
 scan: _guard-docker _guard-venv
 	$(PYTHON) -c "import sys; sys.path.insert(0, 'backend'); from strategies.scanner import run_daily_scan; run_daily_scan()"
 
-## simulate: Run morning execution now (uses last weekday's signals + live prices)
+## simulate: Run morning execution (live). Pass DATE=YYYY-MM-DD for a replay of a past day.
+## simulate: Add COMMIT=1 to write trades to DB: make simulate DATE=2026-03-26 COMMIT=1
 simulate: _guard-docker _guard-venv
-	cd backend && $(abspath $(PYTHON)) -m simulator.simulator morning
+	cd backend && $(abspath $(PYTHON)) -m simulator.simulator $(if $(DATE),replay $(DATE) $(if $(COMMIT),--commit,),morning)
 
 ## simulate-evening: Run evening position management now (uses DB close prices)
 simulate-evening: _guard-docker _guard-venv
@@ -59,6 +61,18 @@ retry-failed: _guard-docker _guard-venv
 ## shell-db: Open an interactive psql session inside kairos_db
 shell-db:
 	docker exec -it kairos_db psql -U kairos -d kairos
+
+## backtest: Run full backtest suite on all strategies (in-sample + out-of-sample)
+backtest: _guard-docker _guard-venv
+	cd backend && $(abspath $(PYTHON)) -m backtesting.run_backtest
+
+## backtest-single: Run backtest for a single strategy and period (STRATEGY=rsi PERIOD=out_of_sample)
+backtest-single: _guard-docker _guard-venv
+	cd backend && $(abspath $(PYTHON)) -m backtesting.run_backtest --strategy $(STRATEGY) --period $(PERIOD)
+
+## hydrate-indicators: Backfill the indicators table for all 600 tickers (10yr, ~1.5M rows)
+hydrate-indicators: _guard-docker _guard-venv
+	cd backend && $(abspath $(PYTHON)) -m backtesting.hydrate_indicators
 
 ## reset-db: DESTRUCTIVE — wipe entire database and recreate from scratch
 reset-db:
