@@ -6,7 +6,8 @@ Jobs (all times Eastern Time, DST-aware via zoneinfo):
   17:00 ET weekdays  — Incremental OHLCV update via update_all()
   17:15 ET weekdays  — Strategy scan: compute indicators + generate signals
   09:31 ET weekdays  — Morning execution: live batch price fetch + execute signals
-  17:25 ET weekdays  — Evening management: DB close prices + position management
+  Hourly (10:00–15:58 ET weekdays) — Intraday management: live price check,
+                                      stop/TP/trailing-stop evaluation
   Every hour (daily) — DB health check (runs weekends too)
 
 The scheduler polls every 30 seconds. ET-timed jobs use a zoneinfo-based
@@ -65,12 +66,12 @@ def _job_morning_execution() -> None:
     run_morning()
 
 
-def _job_evening_management() -> None:
-    """17:25 ET weekdays — DB close prices + position management."""
+def _job_intraday_management() -> None:
+    """10:00–15:58 ET weekdays (hourly) — live price check + position management."""
     if not _is_weekday():
         return
-    from simulator.simulator import run_evening
-    run_evening()
+    from simulator.simulator import run_intraday
+    run_intraday()
 
 
 def _job_morning_digest() -> None:
@@ -94,9 +95,15 @@ def _job_health_check() -> None:
 _ET_JOBS = [
     (7,  0,  True,  _job_morning_digest),
     (9,  31, True,  _job_morning_execution),
+    (10, 0,  True,  _job_intraday_management),
+    (11, 0,  True,  _job_intraday_management),
+    (12, 0,  True,  _job_intraday_management),
+    (13, 0,  True,  _job_intraday_management),
+    (14, 0,  True,  _job_intraday_management),
+    (15, 0,  True,  _job_intraday_management),
+    (15, 58, True,  _job_intraday_management),
     (17, 0,  True,  _job_update_all),
     (17, 15, True,  _job_strategy_scan),
-    (17, 25, True,  _job_evening_management),
 ]
 
 
@@ -149,7 +156,8 @@ def main() -> None:
     logger.info(
         "Scheduler running. "
         "ET jobs: 07:00 digest (P6), 09:31 morning execution, "
-        "17:00 fetch, 17:15 scan, 17:25 evening management. "
+        "10:00-15:58 intraday management (hourly), "
+        "17:00 fetch, 17:15 scan. "
         "Hourly health check active. "
         "Press Ctrl+C to stop."
     )

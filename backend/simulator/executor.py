@@ -132,6 +132,75 @@ def fetch_live_prices(tickers: list[str]) -> dict[str, float]:
     return result
 
 
+def fetch_current_prices(tickers: list[str]) -> dict[str, float]:
+    """Fetch the most recent available 1-minute bar price for each ticker.
+
+    Used by intraday position management (hourly checks). Unlike
+    fetch_live_prices(), there is no 9:31 AM ET cutoff — the latest bar
+    at or before *now* is used.
+    """
+    if not tickers:
+        return {}
+
+    cutoff_utc = datetime.now(timezone.utc)
+    logger.info(f"fetch_current_prices: {len(tickers)} tickers at {cutoff_utc.strftime('%H:%M UTC')}")
+
+    result: dict[str, float] = {}
+    try:
+        df = yf.download(
+            tickers,
+            period="1d",
+            interval="1m",
+            progress=False,
+            auto_adjust=True,
+        )
+        if df is None or df.empty:
+            logger.warning("fetch_current_prices: yfinance returned empty DataFrame")
+            return {}
+
+        if df.index.tz is None:
+            df.index = df.index.tz_localize("America/New_York").tz_convert("UTC")
+        else:
+            df.index = df.index.tz_convert("UTC")
+
+        df = df[df.index <= cutoff_utc]
+        if df.empty:
+            logger.warning("fetch_current_prices: no bars at or before now")
+            return {}
+
+        close = df["Close"]
+
+        def _extract(series) -> Optional[float]:
+            series = series.dropna()
+            if series.empty:
+                return None
+            price = float(series.iloc[-1])
+            return price if price > 0 else None
+
+        if hasattr(close, "columns"):
+            for ticker in tickers:
+                try:
+                    price = _extract(close[ticker])
+                    if price is None:
+                        logger.warning(f"fetch_current_prices: no data for {ticker}")
+                    else:
+                        result[ticker] = price
+                except Exception as exc:
+                    logger.warning(f"fetch_current_prices: error extracting {ticker}: {exc}")
+        else:
+            ticker = tickers[0]
+            price = _extract(close)
+            if price is None:
+                logger.warning(f"fetch_current_prices: no data for {ticker}")
+            else:
+                result[ticker] = price
+
+    except Exception as exc:
+        logger.warning(f"fetch_current_prices: batch download failed: {exc}")
+
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Currency helpers
 # ---------------------------------------------------------------------------

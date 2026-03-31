@@ -82,9 +82,7 @@ CREATE TABLE IF NOT EXISTS trades (
     strategy        TEXT             NOT NULL,
     reason          TEXT             NOT NULL,
     signal_data     JSONB,
-    status          TEXT             NOT NULL DEFAULT 'filled',
-    currency        TEXT             NOT NULL DEFAULT 'USD',   -- Native currency of the asset
-    fx_rate         DOUBLE PRECISION NOT NULL DEFAULT 1.0      -- FX rate to portfolio currency at fill time
+    status          TEXT             NOT NULL DEFAULT 'filled'
 );
 
 -- ---------------------------------------------------------------------------
@@ -115,6 +113,19 @@ CREATE TABLE IF NOT EXISTS watchlist (
     added_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     notes    TEXT
 );
+
+-- ---------------------------------------------------------------------------
+-- fx_rates: historical FX rates at the 9:31 AM ET bar (hypertable)
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS fx_rates (
+    time          TIMESTAMPTZ NOT NULL,
+    pair          TEXT NOT NULL,           -- e.g. 'USDCAD' (1 USD = X CAD)
+    rate          DOUBLE PRECISION NOT NULL,
+    source        TEXT NOT NULL DEFAULT 'yfinance',
+    CONSTRAINT fx_rates_unique UNIQUE (time, pair)
+);
+SELECT create_hypertable('fx_rates', 'time', if_not_exists => TRUE);
+CREATE INDEX IF NOT EXISTS idx_fx_rates_pair ON fx_rates (pair, time DESC);
 
 -- ---------------------------------------------------------------------------
 -- fetch_log: one row per fetch run summarising what happened
