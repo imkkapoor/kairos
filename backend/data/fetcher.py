@@ -175,7 +175,7 @@ def backfill(ticker: str, interval: str = "1d", years: int = 10) -> dict:
     start      = start_date.isoformat()
     end        = (today + timedelta(days=1)).isoformat()  # yfinance end is exclusive
 
-    logger.info(f"[{ticker}] backfill {start} → {today} ({interval})")
+    logger.debug(f"[{ticker}] backfill {start} → {today} ({interval})")
 
     df = _fetch_with_retry(ticker, start=start, end=end, interval=interval)
     df = _normalise(df, ticker)
@@ -186,7 +186,7 @@ def backfill(ticker: str, interval: str = "1d", years: int = 10) -> dict:
 
     try:
         rows = insert_price_data(df, ticker, interval)
-        logger.info(f"[{ticker}] backfill inserted {rows} rows")
+        logger.debug(f"[{ticker}] backfill inserted {rows} rows")
         return {"status": "success", "rows": rows, "ticker": ticker}
     except Exception as exc:
         logger.error(f"[{ticker}] DB insert error during backfill: {exc}")
@@ -213,34 +213,34 @@ def update(ticker: str, interval: str = "1d") -> dict:
     """
     latest = get_latest_timestamp(ticker, interval)
     if latest is None:
-        logger.info(f"[{ticker}] no existing data — running backfill")
+        logger.trace(f"[{ticker}] no existing data — running backfill")
         return backfill(ticker, interval)
 
     today      = datetime.now(timezone.utc).date()
     start_date = (latest + timedelta(days=1)).date()
 
     if start_date > today:
-        logger.debug(f"[{ticker}] already up-to-date (latest: {latest.date()})")
+        logger.trace(f"[{ticker}] already up-to-date (latest: {latest.date()})")
         return {"status": "skipped", "rows": 0, "ticker": ticker}
 
     start = start_date.isoformat()
     end   = (today + timedelta(days=1)).isoformat()  # yfinance end is exclusive
 
-    logger.info(f"[{ticker}] update {start} → {today} ({interval})")
+    logger.trace(f"[{ticker}] update {start} → {today} ({interval})")
 
     df = _fetch_with_retry(ticker, start=start, end=end, interval=interval)
     df = _normalise(df, ticker)
 
     if df.empty:
         if start_date >= today:
-            logger.debug(f"[{ticker}] no new daily bar yet (market may still be open)")
+            logger.trace(f"[{ticker}] no new daily bar yet (market may still be open)")
             return {"status": "skipped", "rows": 0, "ticker": ticker}
         logger.warning(f"[{ticker}] empty DataFrame after fetch/normalise")
         return {"status": "error", "rows": 0, "ticker": ticker}
 
     try:
         rows = insert_price_data(df, ticker, interval)
-        logger.info(f"[{ticker}] update inserted {rows} rows")
+        logger.trace(f"[{ticker}] update inserted {rows} rows")
         return {"status": "success", "rows": rows, "ticker": ticker}
     except Exception as exc:
         logger.error(f"[{ticker}] DB insert error during update: {exc}")

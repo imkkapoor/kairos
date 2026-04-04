@@ -15,7 +15,6 @@ TWO daily jobs (scheduled via scheduler.py):
 THIS IS THE ONLY FILE in simulator/ that calls DB write functions.
 """
 
-import os
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -27,6 +26,8 @@ from db.connection import (
     get_latest_close_prices,
     close_trade,
     insert_trade,
+    insert_fx_rate,
+    get_fx_rate,
     mark_signal_acted_on,
     update_stop_loss,
     get_sector_map,
@@ -70,7 +71,7 @@ def run_morning() -> None:
     portfolio = Portfolio.load_from_db()
 
     # ------------------------------------------------------------------
-    # 2. Load last night's signals, sorted by strength DESC
+    # 2. Load last night's signals, sorted by z_score DESC
     #    Signals are written at ~17:15 ET (21-22 UTC) by the previous
     #    evening's scanner, so they live in yesterday's UTC date window.
     # ------------------------------------------------------------------
@@ -85,7 +86,10 @@ def run_morning() -> None:
         return
 
     todays_signals: list[dict] = signals_df.to_dict("records")
-    todays_signals.sort(key=lambda s: float(s.get("strength", 0.0)), reverse=True)
+    todays_signals.sort(
+        key=lambda s: float(s.get("z_score") if s.get("z_score") is not None else s.get("strength", 0.0)),
+        reverse=True,
+    )
 
     # ------------------------------------------------------------------
     # 3. Fetch live prices in ONE batch for signals + open positions
@@ -96,6 +100,10 @@ def run_morning() -> None:
 
     logger.info(f"run_morning: fetching live prices for {len(tickers_needed)} tickers")
     current_prices = executor.fetch_live_prices(tickers_needed)
+
+    # Pin all trade timestamps to 9:31 AM ET (same anchor as fill prices)
+    # so manual runs and the scheduled job produce identical trade rows.
+    trade_time = executor._open_cutoff_utc()
 
     # ------------------------------------------------------------------
     # 4. Load today's indicators (written last night by scanner)
@@ -110,15 +118,22 @@ def run_morning() -> None:
 
     portfolio_ccy = portfolio.currency  # e.g. 'CAD'
     fx_rates: dict[str, float] = {portfolio_ccy: 1.0}
+    today_start_utc = now.replace(hour=0, minute=0, second=0, microsecond=0)
     # Determine which foreign currencies are needed
     needed_ccys = {executor.get_ticker_currency(t, market_map) for t in tickers_needed}
     for ccy in needed_ccys:
         if ccy != portfolio_ccy and ccy not in fx_rates:
-            rate = executor.fetch_fx_rate(ccy, portfolio_ccy)
+            pair = f"{ccy}{portfolio_ccy}"
+            rate = get_fx_rate(pair, since=today_start_utc)
+            if rate is None:
+                # Not yet in DB for today — fetch live once and persist
+                rate = executor.fetch_fx_rate(ccy, portfolio_ccy)
+                if rate is not None:
+                    insert_fx_rate(pair, rate)
             if rate is not None:
                 fx_rates[ccy] = rate
             else:
-                logger.warning(f"run_morning: could not fetch {ccy}→{portfolio_ccy} rate, using 1.0")
+                logger.warning(f"run_morning: could not get {ccy}→{portfolio_ccy} rate, using 1.0")
                 fx_rates[ccy] = 1.0
     logger.info(f"run_morning: FX rates ({portfolio_ccy} base): {fx_rates}")
 
@@ -150,8 +165,8 @@ def run_morning() -> None:
                 signal_strength = trade["signal_strength"],
                 reason          = trade["reason"],
                 signal_data     = trade.get("signal_data"),
-                currency        = trade.get("currency", "USD"),
-                fx_rate         = trade.get("fx_rate", 1.0),
+                trade_time      = trade_time,
+                fill_type       = trade.get("fill_type"),
             )
             signal_id = trade.get("signal_id")
             if signal_id is not None:
@@ -171,7 +186,7 @@ def run_morning() -> None:
                 "fx_rate":     trade.get("fx_rate", 1.0),
             })
         elif trade["side"] == "sell":
-            close_trade(trade["ticker"], trade["fill_price"], trade["reason"])
+            close_trade(trade["ticker"], trade["fill_price"], trade["reason"], trade_time=trade_time)
             signal_id = trade.get("signal_id")
             if signal_id is not None:
                 try:
@@ -256,14 +271,21 @@ def run_evening() -> None:
     market_map = get_market_map()
     portfolio_ccy = portfolio.currency
     fx_rates: dict[str, float] = {portfolio_ccy: 1.0}
+    today_start_utc = now.replace(hour=0, minute=0, second=0, microsecond=0)
     needed_ccys = {executor.get_ticker_currency(t, market_map) for t in position_tickers}
     for ccy in needed_ccys:
         if ccy != portfolio_ccy and ccy not in fx_rates:
-            rate = executor.fetch_fx_rate(ccy, portfolio_ccy)
+            pair = f"{ccy}{portfolio_ccy}"
+            rate = get_fx_rate(pair, since=today_start_utc)
+            if rate is None:
+                # Not in DB for today — fetch live once and persist
+                rate = executor.fetch_fx_rate(ccy, portfolio_ccy)
+                if rate is not None:
+                    insert_fx_rate(pair, rate)
             if rate is not None:
                 fx_rates[ccy] = rate
             else:
-                logger.warning(f"run_evening: could not fetch {ccy}→{portfolio_ccy} rate, using 1.0")
+                logger.warning(f"run_evening: could not get {ccy}→{portfolio_ccy} rate, using 1.0")
                 fx_rates[ccy] = 1.0
     logger.info(f"run_evening: FX rates ({portfolio_ccy} base): {fx_rates}")
 
@@ -335,6 +357,123 @@ def run_evening() -> None:
         f"run_evening complete: closed={len(summary_closed)}, "
         f"trailing_updates={len(trailing_stop_updates)}"
     )
+
+
+def run_intraday() -> None:
+    """Hourly 10:00–15:58 ET — live price check; manage stops/TPs/trailing stops.
+
+    Fetches live 1-minute bar prices for all open positions, runs
+    position_manager, persists any closes/trailing-stop updates to the DB,
+    and takes a portfolio snapshot only when something changed.
+    Does NOT open new trades.
+    """
+    now    = datetime.now(timezone.utc)
+    now_et = now.astimezone(_ET)
+    now_str = now_et.strftime("%Y-%m-%d %H:%M ET")
+    logger.info(f"=== Kairos intraday management starting {now_str} ===")
+
+    # ------------------------------------------------------------------
+    # 1. Load portfolio
+    # ------------------------------------------------------------------
+    portfolio = Portfolio.load_from_db()
+
+    if not portfolio.positions:
+        logger.info("run_intraday: no open positions — nothing to manage")
+        return
+
+    position_tickers = list(portfolio.positions.keys())
+
+    # ------------------------------------------------------------------
+    # 2. Fetch live prices right now (no 9:31 cutoff)
+    # ------------------------------------------------------------------
+    current_prices = executor.fetch_current_prices(position_tickers)
+
+    if not current_prices:
+        logger.warning(
+            "run_intraday: no live prices returned for any position "
+            "(market closed / holiday?) — skipping this run"
+        )
+        return
+
+    missing = [t for t in position_tickers if t not in current_prices]
+    if missing:
+        logger.warning(f"run_intraday: no live price for: {missing}")
+        # Fill gaps (e.g. TSX-listed tickers on Canadian holidays) with the
+        # last known close from the DB so the snapshot uses a real price,
+        # not the at-cost fallback in get_total_value().
+        last_close = get_latest_close_prices(missing)
+        for t, price in last_close.items():
+            current_prices[t] = price
+            logger.info(f"run_intraday: using last DB close for {t}: {price:.4f}")
+
+    # ------------------------------------------------------------------
+    # 3. FX rates from DB (fallback to live fetch + persist if absent)
+    # ------------------------------------------------------------------
+    market_map    = get_market_map()
+    portfolio_ccy = portfolio.currency
+    fx_rates: dict[str, float] = {portfolio_ccy: 1.0}
+    today_start_utc = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    needed_ccys = {executor.get_ticker_currency(t, market_map) for t in position_tickers}
+    for ccy in needed_ccys:
+        if ccy != portfolio_ccy and ccy not in fx_rates:
+            pair = f"{ccy}{portfolio_ccy}"
+            rate = get_fx_rate(pair, since=today_start_utc)
+            if rate is None:
+                rate = executor.fetch_fx_rate(ccy, portfolio_ccy)
+                if rate is not None:
+                    insert_fx_rate(pair, rate)
+            if rate is not None:
+                fx_rates[ccy] = rate
+            else:
+                logger.warning(f"run_intraday: could not get {ccy}→{portfolio_ccy} rate, using 1.0")
+                fx_rates[ccy] = 1.0
+
+    # ------------------------------------------------------------------
+    # 4. Indicators + today's signals for position_manager
+    # ------------------------------------------------------------------
+    today_indicators = get_latest_indicators(position_tickers)
+    signals_df       = get_todays_signals(for_date=now)
+    todays_signals: list[dict] = [] if signals_df.empty else signals_df.to_dict("records")
+
+    # ------------------------------------------------------------------
+    # 5. Check positions for exits / trailing stop updates
+    # ------------------------------------------------------------------
+    close_actions, trailing_stop_updates = position_manager.check_positions(
+        portfolio, current_prices, today_indicators, todays_signals
+    )
+
+    summary_closed: list[dict] = []
+    for action in close_actions:
+        ticker     = action["ticker"]
+        exit_price = action["exit_price"]
+        reason     = action["reason"]
+        pnl = portfolio.close_position(ticker, exit_price)
+        close_trade(ticker, exit_price, reason)
+        summary_closed.append({
+            "ticker":     ticker,
+            "exit_price": exit_price,
+            "reason":     reason,
+            "pnl":        pnl,
+        })
+
+    for item in trailing_stop_updates:
+        update_stop_loss(item["ticker"], item["new_stop_loss"])
+
+    # Always snapshot so the chart has a live-price data point every intraday run
+    portfolio.snapshot(current_prices, fx_rates=fx_rates, market_map=market_map)
+
+    logger.info(
+        f"run_intraday complete: closed={len(summary_closed)}, "
+        f"trailing_updates={len(trailing_stop_updates)}"
+    )
+    if summary_closed:
+        for t in summary_closed:
+            pnl_val = t["pnl"]
+            pnl_str = f"{'+' if pnl_val >= 0 else ''}${pnl_val:,.2f}"
+            logger.info(
+                f"  {t['ticker']:8s} SELL @ ${t['exit_price']:.2f}  "
+                f"P&L: {pnl_str}  {t['reason']}"
+            )
 
 
 if __name__ == "__main__":

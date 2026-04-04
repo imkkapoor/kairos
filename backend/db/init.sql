@@ -63,7 +63,8 @@ CREATE TABLE IF NOT EXISTS signals (
     regime             TEXT,
     regime_confidence  DOUBLE PRECISION,
     acted_on           BOOLEAN     NOT NULL DEFAULT FALSE,
-    sentiment_score    DOUBLE PRECISION   -- NULL until Phase 5
+    sentiment_score    DOUBLE PRECISION,  -- NULL until Phase 5
+    z_score            DOUBLE PRECISION   -- Cross-universe normalized score
 );
 
 -- ---------------------------------------------------------------------------
@@ -83,9 +84,11 @@ CREATE TABLE IF NOT EXISTS trades (
     reason          TEXT             NOT NULL,
     signal_data     JSONB,
     status          TEXT             NOT NULL DEFAULT 'filled',
-    currency        TEXT             NOT NULL DEFAULT 'USD',   -- Native currency of the asset
-    fx_rate         DOUBLE PRECISION NOT NULL DEFAULT 1.0      -- FX rate to portfolio currency at fill time
+    fill_type       TEXT             -- 'Normal Fill' | 'Capped to Max Size' | 'Partial Fill' | 'Capped & Partial'
 );
+
+-- Idempotent migration: add fill_type to pre-existing tables.
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS fill_type TEXT;
 
 -- ---------------------------------------------------------------------------
 -- portfolio_snapshots: point-in-time portfolio state (hypertable)
@@ -115,6 +118,19 @@ CREATE TABLE IF NOT EXISTS watchlist (
     added_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     notes    TEXT
 );
+
+-- ---------------------------------------------------------------------------
+-- fx_rates: historical FX rates at the 9:31 AM ET bar (hypertable)
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS fx_rates (
+    time          TIMESTAMPTZ NOT NULL,
+    pair          TEXT NOT NULL,           -- e.g. 'USDCAD' (1 USD = X CAD)
+    rate          DOUBLE PRECISION NOT NULL,
+    source        TEXT NOT NULL DEFAULT 'yfinance',
+    CONSTRAINT fx_rates_unique UNIQUE (time, pair)
+);
+SELECT create_hypertable('fx_rates', 'time', if_not_exists => TRUE);
+CREATE INDEX IF NOT EXISTS idx_fx_rates_pair ON fx_rates (pair, time DESC);
 
 -- ---------------------------------------------------------------------------
 -- fetch_log: one row per fetch run summarising what happened

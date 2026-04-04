@@ -481,6 +481,94 @@ def get_portfolio_history(days: int = 90) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# FX rates
+# ---------------------------------------------------------------------------
+
+def insert_fx_rate(
+    pair: str,
+    rate: float,
+    at_time: Optional[datetime] = None,
+    source: str = "yfinance",
+) -> None:
+    """Upsert an FX rate row into the fx_rates table.
+
+    Parameters
+    ----------
+    pair:
+        Currency pair, e.g. 'USDCAD' meaning 1 USD = rate CAD.
+    rate:
+        The exchange rate.
+    at_time:
+        UTC-aware datetime for this rate; defaults to now().
+    source:
+        Data source label (default 'yfinance').
+    """
+    if at_time is None:
+        at_time = datetime.now(timezone.utc)
+    at_time = to_utc(at_time)
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO fx_rates (time, pair, rate, source)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT ON CONSTRAINT fx_rates_unique DO UPDATE SET rate = EXCLUDED.rate
+                """,
+                (at_time, pair, round(float(rate), 6), source),
+            )
+
+
+def get_fx_rate(
+    pair: str,
+    at_time: Optional[datetime] = None,
+    since: Optional[datetime] = None,
+) -> Optional[float]:
+    """Return the most recent stored FX rate for *pair* at or before *at_time*.
+
+    Parameters
+    ----------
+    pair:
+        Currency pair, e.g. 'USDCAD'.
+    at_time:
+        UTC-aware datetime upper bound; defaults to now().
+    since:
+        Optional UTC-aware lower bound. When provided, only rows with
+        ``time >= since`` are considered. Use this to check whether a rate
+        has already been stored *today* (pass midnight UTC as *since*).
+
+    Returns None if no row is found.
+    """
+    if at_time is None:
+        at_time = datetime.now(timezone.utc)
+    at_time = to_utc(at_time)
+    if since is not None:
+        since = to_utc(since)
+        query = text(
+            """
+            SELECT rate FROM fx_rates
+            WHERE pair = :pair AND time <= :at_time AND time >= :since
+            ORDER BY time DESC
+            LIMIT 1
+            """
+        )
+        params: dict = {"pair": pair, "at_time": at_time, "since": since}
+    else:
+        query = text(
+            """
+            SELECT rate FROM fx_rates
+            WHERE pair = :pair AND time <= :at_time
+            ORDER BY time DESC
+            LIMIT 1
+            """
+        )
+        params = {"pair": pair, "at_time": at_time}
+    engine = get_engine()
+    with engine.connect() as conn:
+        val = conn.execute(query, params).scalar()
+    return float(val) if val is not None else None
+
+
+# ---------------------------------------------------------------------------
 # Indicators
 # ---------------------------------------------------------------------------
 
@@ -707,6 +795,7 @@ def insert_signals(signals: list[dict], signal_time=None) -> list[int]:
             s.get("regime"),
             s.get("regime_confidence"),
             False,  # acted_on
+            s.get("z_score"),
         )
         for s in signals
     ]
@@ -718,7 +807,7 @@ def insert_signals(signals: list[dict], signal_time=None) -> list[int]:
                 """
                 INSERT INTO signals
                     (time, ticker, strategy, signal_type, strength, reason,
-                     indicator_vals, regime, regime_confidence, acted_on)
+                     indicator_vals, regime, regime_confidence, acted_on, z_score)
                 VALUES %s
                 RETURNING id
                 """,
@@ -759,7 +848,7 @@ def get_todays_signals(
         params["min_strength"] = min_strength
 
     where = " AND ".join(conditions)
-    query = text(f"SELECT * FROM signals WHERE {where} ORDER BY strength DESC")
+    query = text(f"SELECT * FROM signals WHERE {where} ORDER BY z_score DESC NULLS LAST, strength DESC")
     df = pd.read_sql(query, engine, params=params, parse_dates=["time"])
     return df
 
@@ -834,25 +923,28 @@ def insert_trade(
     signal_strength: Optional[float],
     reason: str,
     signal_data=None,
-    currency: str = "USD",
-    fx_rate: float = 1.0,
+    trade_time: Optional[datetime] = None,
+    fill_type: Optional[str] = None,
 ) -> int:
     """Insert a new trade row. Returns the new trade id.
 
     Monetary values are rounded to 2 decimal places before storage.
-    currency: native currency of the asset (USD, CAD).
-    fx_rate: rate from native currency to portfolio base currency at fill time.
+    FX conversion is tracked in the dedicated fx_rates table, not per-trade.
+
+    trade_time:
+        UTC-aware datetime to stamp the row with. Defaults to now().
+        Pass the 9:31 AM ET open-cutoff so manual runs produce the same
+        timestamp as the scheduled job.
     """
-    now = datetime.now(timezone.utc)
+    now = trade_time if trade_time is not None else datetime.now(timezone.utc)
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO trades
                     (time, ticker, side, quantity, fill_price, stop_loss, take_profit,
-                     signal_strength, strategy, reason, signal_data, status,
-                     currency, fx_rate)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'filled', %s, %s)
+                     signal_strength, strategy, reason, signal_data, status, fill_type)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'filled', %s)
                 RETURNING id
                 """,
                 (
@@ -867,15 +959,14 @@ def insert_trade(
                     strategy,
                     reason,
                     json.dumps(signal_data) if signal_data is not None and not isinstance(signal_data, str) else signal_data,
-                    currency,
-                    round(float(fx_rate), 6),
+                    fill_type,
                 ),
             )
             row = cur.fetchone()
             return row[0]
 
 
-def close_trade(ticker: str, exit_price: float, exit_reason: str) -> float:
+def close_trade(ticker: str, exit_price: float, exit_reason: str, trade_time: Optional[datetime] = None) -> float:
     """Close an open buy trade for ticker in a single transaction.
 
     Actions (atomic):
@@ -889,13 +980,13 @@ def close_trade(ticker: str, exit_price: float, exit_reason: str) -> float:
         Realised P&L = (exit_price - original_fill_price) * quantity.
         Returns 0.0 if no open buy trade is found.
     """
-    now = datetime.now(timezone.utc)
+    now = trade_time if trade_time is not None else datetime.now(timezone.utc)
     with get_conn() as conn:
         with conn.cursor() as cur:
             # Find most recent open buy trade
             cur.execute(
                 """
-                SELECT id, quantity, fill_price, strategy, currency, fx_rate
+                SELECT id, quantity, fill_price, strategy
                 FROM trades
                 WHERE ticker = %s AND side = 'buy' AND status = 'filled'
                 ORDER BY time DESC
@@ -908,17 +999,16 @@ def close_trade(ticker: str, exit_price: float, exit_reason: str) -> float:
                 logger.warning(f"close_trade: no open buy trade found for {ticker}")
                 return 0.0
 
-            orig_id, quantity, orig_fill, strategy, currency, fx_rate = row
+            orig_id, quantity, orig_fill, strategy = row
             realised_pnl = (float(exit_price) - float(orig_fill)) * float(quantity)
 
-            # Insert sell trade (carry currency + fx_rate from the buy)
+            # Insert sell trade
             cur.execute(
                 """
                 INSERT INTO trades
                     (time, ticker, side, quantity, fill_price, stop_loss, take_profit,
-                     signal_strength, strategy, reason, signal_data, status,
-                     currency, fx_rate)
-                VALUES (%s, %s, 'sell', %s, %s, NULL, NULL, NULL, %s, %s, NULL, 'filled', %s, %s)
+                     signal_strength, strategy, reason, signal_data, status)
+                VALUES (%s, %s, 'sell', %s, %s, NULL, NULL, NULL, %s, %s, NULL, 'filled')
                 """,
                 (
                     now,
@@ -927,8 +1017,6 @@ def close_trade(ticker: str, exit_price: float, exit_reason: str) -> float:
                     round(float(exit_price), 2),
                     strategy,
                     exit_reason,
-                    currency,
-                    float(fx_rate),
                 ),
             )
 
