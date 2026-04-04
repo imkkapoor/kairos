@@ -2,7 +2,7 @@ VENV   := backend/.venv
 PYTHON := $(VENV)/bin/python
 PIP    := $(VENV)/bin/pip
 
-.PHONY: install up down logs setup run scan fetch retry-failed simulate simulate-evening shell-db reset-db help \
+.PHONY: install up down logs setup run scan fetch retry-failed simulate simulate-evening api shell-db reset-db help \
         _guard-docker _guard-venv
 
 ## install: Create .venv, upgrade pip, install all requirements
@@ -47,6 +47,10 @@ simulate: _guard-docker _guard-venv
 ## simulate-evening: Run evening position management now (uses DB close prices)
 simulate-evening: _guard-docker _guard-venv
 	cd backend && $(abspath $(PYTHON)) -m simulator.simulator evening
+
+## api: Start the FastAPI server on port 8000 (reload on file changes)
+api: _guard-docker _guard-venv
+	cd backend && $(abspath $(VENV)/bin/uvicorn) api:app --host 0.0.0.0 --port 8000 --reload
 
 ## fetch: Incremental update for all active watchlist tickers
 fetch:
