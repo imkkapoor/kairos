@@ -2,7 +2,7 @@ VENV   := backend/.venv
 PYTHON := $(VENV)/bin/python
 PIP    := $(VENV)/bin/pip
 
-.PHONY: install up down logs setup run scan fetch retry-failed simulate simulate-evening api shell-db reset-db help \
+.PHONY: install up down logs setup run scan fetch retry-failed simulate simulate-evening api dashboard shell-db reset-db help \
         _guard-docker _guard-venv
 
 ## install: Create .venv, upgrade pip, install all requirements
@@ -50,8 +50,12 @@ simulate-evening: _guard-docker _guard-venv
 
 ## api: Start the FastAPI server on port 8000 (reload on file changes)
 api: _guard-docker _guard-venv
-	cd backend && $(abspath $(VENV)/bin/uvicorn) api:app --host 0.0.0.0 --port 8000 --reload
+	cd backend && $(abspath $(VENV)/bin/uvicorn) api.api:app --host 0.0.0.0 --port 8000 --reload --reload-dir .
 
+## dashboard: Start the React development server on port 3000
+dashboard:
+	cd dashboard && pnpm install && pnpm dev
+	
 ## fetch: Incremental update for all active watchlist tickers
 fetch:
 	$(PYTHON) backend/data/fetcher.py update
