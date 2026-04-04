@@ -283,13 +283,13 @@ def execute_signals(
     market_map: Optional[dict[str, str]] = None,
     fx_rates: Optional[dict[str, float]] = None,
 ) -> tuple[list[dict], list[dict]]:
-    """Process a list of signals (sorted by strength DESC) and execute eligible trades.
+    """Process a list of signals (sorted by z_score DESC) and execute eligible trades.
 
     Parameters
     ----------
     signals:
-        List of signal dicts sorted by strength DESC. Must include: ticker, signal_type,
-        strategy, strength.
+        List of signal dicts sorted by z_score DESC. Must include: ticker, signal_type,
+        strategy, strength. z_score is used for priority; strength drives position sizing.
     portfolio:
         Live Portfolio object. Mutated in place for each executed trade.
     current_prices:
@@ -313,12 +313,22 @@ def execute_signals(
     max_portfolio_risk   = float(os.environ.get("MAX_PORTFOLIO_RISK", _MAX_PORTFOLIO_RISK))
     atr_multiplier       = float(os.environ.get("ATR_MULTIPLIER", _ATR_MULTIPLIER))
     take_profit_atr_mult = float(os.environ.get("TAKE_PROFIT_ATR_MULT", _TAKE_PROFIT_ATR_MULT))
-    min_strength = float(os.environ.get("MIN_SIGNAL_STRENGTH", "0.10"))
+    min_strength         = float(os.environ.get("MIN_SIGNAL_STRENGTH", "0.10"))
+    max_position_size    = float(os.environ.get("MAX_POSITION_SIZE", 0.10))
+    max_total_exposure   = float(os.environ.get("MAX_TOTAL_EXPOSURE", 0.80))
 
     if market_map is None:
         market_map = {}
     if fx_rates is None:
         fx_rates = {}
+
+    # Sort by z_score DESC so statistically extreme signals get first pick of capital.
+    # Falls back to strength when z_score is absent (e.g. manually inserted signals).
+    signals = sorted(
+        signals,
+        key=lambda s: float(s.get("z_score") if s.get("z_score") is not None else s.get("strength", 0.0)),
+        reverse=True,
+    )
 
     just_opened: set[str] = set()
     executed: list[dict] = []
@@ -382,6 +392,59 @@ def execute_signals(
 
             cost_native = qty * price
             cost_base   = cost_native * fx
+
+            # ------------------------------------------------------------------
+            # Cap-and-fill: adjust qty rather than skipping high-conviction trades.
+            # ------------------------------------------------------------------
+            fill_type = "Normal Fill"
+
+            # 1. Cap to max single-position size.
+            max_cost_by_size = max_position_size * total_value
+            if cost_base > max_cost_by_size:
+                capped_qty = floor(max_cost_by_size / (price * fx))
+                if capped_qty < 1:
+                    skipped.append({
+                        "ticker": ticker,
+                        "reason": (
+                            f"Position capped to max size {max_position_size:.0%} "
+                            f"yields qty < 1 (budget=${max_cost_by_size:.2f})"
+                        ),
+                    })
+                    continue
+                qty         = capped_qty
+                cost_native = qty * price
+                cost_base   = cost_native * fx
+                fill_type   = "Capped to Max Size"
+
+            # 2. Partial fill if trade would breach total exposure cap.
+            current_exp      = portfolio.get_current_exposure(current_prices, fx_rates, market_map)
+            remaining_budget = (max_total_exposure - current_exp) * total_value
+            if remaining_budget <= 0:
+                skipped.append({
+                    "ticker": ticker,
+                    "reason": (
+                        f"Total exposure {current_exp:.1%} already at or above "
+                        f"limit {max_total_exposure:.0%}"
+                    ),
+                })
+                continue
+            if cost_base > remaining_budget:
+                partial_qty = floor(remaining_budget / (price * fx))
+                if partial_qty < 1:
+                    skipped.append({
+                        "ticker": ticker,
+                        "reason": (
+                            f"Partial fill for exposure cap yields qty < 1 "
+                            f"(budget=${remaining_budget:.2f})"
+                        ),
+                    })
+                    continue
+                qty         = partial_qty
+                cost_native = qty * price
+                cost_base   = cost_native * fx
+                fill_type   = "Capped & Partial" if fill_type == "Capped to Max Size" else "Partial Fill"
+            # ------------------------------------------------------------------
+
             take_profit = price + (take_profit_atr_mult * atr)
             sector      = sector_map.get(ticker, "Unknown")
 
@@ -407,11 +470,13 @@ def execute_signals(
                 "signal_id":       signal.get("id"),
                 "currency":        ccy,
                 "fx_rate":         round(fx, 6),
+                "fill_type":       fill_type,
             }
             executed.append(trade)
             logger.info(
                 f"BUY  {ticker}: {qty}sh @ ${price:.2f} "
-                f"SL=${stop_loss:.2f} TP=${take_profit:.2f} [{strategy}] str={strength:.2f}"
+                f"SL=${stop_loss:.2f} TP=${take_profit:.2f} [{strategy}] "
+                f"str={strength:.2f} [{fill_type}]"
             )
 
         elif signal_type == "sell":

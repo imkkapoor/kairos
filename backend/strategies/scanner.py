@@ -52,6 +52,55 @@ import strategies.sector_rotation as sector_rotation_strategy
 
 
 # ---------------------------------------------------------------------------
+# Z-score normalisation
+# ---------------------------------------------------------------------------
+
+_Z_SCORE_CAP = 3.0  # Winsorize at ±3σ (99.7th percentile) to prevent outlier domination
+
+
+def _compute_z_scores(signals: list[dict]) -> None:
+    """Compute cross-universe Z-scores in place, grouped by strategy.
+
+    For each strategy group, calculates mean and std of strength values,
+    then sets z_score = clip((strength - mean) / std, -3.0, +3.0).
+
+    Clipping at ±3σ (Winsorization) prevents a single outlier ticker from
+    inflating σ and compressing all other signals toward zero. Any raw Z
+    beyond ±3 is treated as equivalent to the cap — it still gets highest
+    priority but doesn't receive 10x weight over a normally strong signal.
+
+    If std is zero (all signals identical), z_score is set to 0.0.
+    """
+    from collections import defaultdict
+
+    groups: dict[str, list[dict]] = defaultdict(list)
+    for sig in signals:
+        groups[sig.get("strategy", "unknown")].append(sig)
+
+    for strategy, sigs in groups.items():
+        strengths = [float(s.get("strength", 0.0)) for s in sigs]
+        n = len(strengths)
+        if n == 0:
+            continue
+        mean = sum(strengths) / n
+        variance = sum((x - mean) ** 2 for x in strengths) / n
+        std = variance ** 0.5
+
+        if std == 0:
+            for s in sigs:
+                s["z_score"] = 0.0
+        else:
+            for s, x in zip(sigs, strengths):
+                raw_z = (x - mean) / std
+                s["z_score"] = max(min(raw_z, _Z_SCORE_CAP), -_Z_SCORE_CAP)
+
+    logger.debug(
+        f"[scanner] Z-scores computed for {len(signals)} signals across "
+        f"{len(groups)} strategies (capped at ±{_Z_SCORE_CAP})"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Summary helpers
 # ---------------------------------------------------------------------------
 
@@ -105,7 +154,11 @@ def _print_summary(
     rev_avg  = _avg_strength(reversal_signals)
     sec_avg  = _avg_strength(sector_signals)
 
-    top5 = sorted(all_signals, key=lambda s: s["strength"], reverse=True)[:5]
+    top5 = sorted(
+        all_signals,
+        key=lambda s: (s.get("z_score") if s.get("z_score") is not None else float('-inf')),
+        reverse=True,
+    )[:5]
 
     print(f"-- Kairos signal scan — {today_str} --")
     print(f"Tickers scanned: {total_tickers} | Computed: {computed} | Skipped: {skipped}")
@@ -117,9 +170,11 @@ def _print_summary(
     print(f"Sector rotation: {sec_buy} buy | {sec_sell} sell (avg strength {sec_avg:.2f})")
     print(f"Skipped (open position): {skipped_open_count}")
     if top5:
-        print("Top 5 by strength:")
+        print("Top 5 by z-score:")
         for s in top5:
-            print(f"  {s['ticker']:8s} {s['signal_type']:4s} {s['strategy']:16s} {s['strength']:.4f}  \"{s['reason']}\"")
+            z = s.get("z_score")
+            z_str = f"{z:+.2f}" if z is not None else "N/A"
+            print(f"  {s['ticker']:8s} {s['signal_type']:4s} {s['strategy']:16s} z={z_str} str={s['strength']:.4f}  \"{s['reason']}\"")
     print("-------------------------------------------")
 
 
@@ -269,9 +324,10 @@ def run_daily_scan(interval: str = "1d") -> None:
         f"SectorRotation:{len(sector_signals)}"
     )
 
-    # 9. Persist all signals
+    # 9. Persist all signals (with Z-scores)
     all_signals = rsi_signals + mom_signals + macd_signals + reversal_signals + sector_signals
     if all_signals:
+        _compute_z_scores(all_signals)
         try:
             signal_ids = insert_signals(all_signals, signal_time=trading_day)
             logger.info(f"[scanner] Inserted {len(signal_ids)} signals: {signal_ids}")

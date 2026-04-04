@@ -63,7 +63,8 @@ CREATE TABLE IF NOT EXISTS signals (
     regime             TEXT,
     regime_confidence  DOUBLE PRECISION,
     acted_on           BOOLEAN     NOT NULL DEFAULT FALSE,
-    sentiment_score    DOUBLE PRECISION   -- NULL until Phase 5
+    sentiment_score    DOUBLE PRECISION,  -- NULL until Phase 5
+    z_score            DOUBLE PRECISION   -- Cross-universe normalized score
 );
 
 -- ---------------------------------------------------------------------------
@@ -82,8 +83,12 @@ CREATE TABLE IF NOT EXISTS trades (
     strategy        TEXT             NOT NULL,
     reason          TEXT             NOT NULL,
     signal_data     JSONB,
-    status          TEXT             NOT NULL DEFAULT 'filled'
+    status          TEXT             NOT NULL DEFAULT 'filled',
+    fill_type       TEXT             -- 'Normal Fill' | 'Capped to Max Size' | 'Partial Fill' | 'Capped & Partial'
 );
+
+-- Idempotent migration: add fill_type to pre-existing tables.
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS fill_type TEXT;
 
 -- ---------------------------------------------------------------------------
 -- portfolio_snapshots: point-in-time portfolio state (hypertable)
