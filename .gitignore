@@ -5,6 +5,7 @@ __pycache__/
 *.pyo
 *.egg-info/
 backend/logs/
+backend/backtesting/output/
 .DS_Store
 node_modules/
 .next/

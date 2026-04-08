@@ -2,7 +2,7 @@ VENV   := backend/.venv
 PYTHON := $(VENV)/bin/python
 PIP    := $(VENV)/bin/pip
 
-.PHONY: install up down logs setup run scan fetch retry-failed simulate simulate-evening api dashboard shell-db reset-db help \
+.PHONY: install up down logs setup run scan fetch fetch-debug retry-failed simulate simulate-evening api api-debug dashboard shell-db reset-db backtest backtest-config hydrate-indicators hydrate-fx fetch-vix help \
         _guard-docker _guard-venv
 
 ## install: Create .venv, upgrade pip, install all requirements
@@ -52,6 +52,10 @@ simulate-evening: _guard-docker _guard-venv
 api: _guard-docker _guard-venv
 	cd backend && $(abspath $(VENV)/bin/uvicorn) api.api:app --host 0.0.0.0 --port 8000 --reload --reload-dir .
 
+## api-debug: Same as api but with DEBUG logging (shows yfinance requests + responses)
+api-debug: _guard-docker _guard-venv
+	cd backend && LOGURU_LEVEL=DEBUG $(abspath $(VENV)/bin/uvicorn) api.api:app --host 0.0.0.0 --port 8000 --reload --reload-dir .
+
 ## dashboard: Start the React development server on port 3000
 dashboard:
 	cd dashboard && pnpm install && pnpm dev
@@ -60,9 +64,33 @@ dashboard:
 fetch:
 	$(PYTHON) backend/data/fetcher.py update
 
+## fetch-debug: Same as fetch but with DEBUG logging (shows every yfinance request + response)
+fetch-debug: _guard-docker _guard-venv
+	LOGURU_LEVEL=DEBUG $(PYTHON) backend/data/fetcher.py update
+
 ## retry-failed: Retry tickers that failed in last fetch (DATE=YYYY-MM-DD, default: today)
 retry-failed: _guard-docker _guard-venv
 	$(PYTHON) backend/data/fetcher.py retry-failed $(if $(DATE),--date $(DATE),)
+
+## backtest: Run full WFA backtest across all allocation configs
+backtest: _guard-docker _guard-venv
+	cd backend && $(abspath $(PYTHON)) -m backtesting.run_backtest
+
+## backtest-config: Run WFA backtest for one specific config (CONFIG=name)
+backtest-config: _guard-docker _guard-venv
+	cd backend && $(abspath $(PYTHON)) -m backtesting.run_backtest --config $(CONFIG)
+
+## hydrate-indicators: Backfill full historical indicators for all tickers (needed for backtesting)
+hydrate-indicators: _guard-docker _guard-venv
+	cd backend && $(abspath $(PYTHON)) -m data.hydrate_indicators
+
+## hydrate-fx: Backfill historical USDCAD FX rates from 2017
+hydrate-fx: _guard-docker _guard-venv
+	cd backend && $(abspath $(PYTHON)) -m data.hydrate_fx_rates
+
+## fetch-vix: One-time backfill of VIX history from 2017-01-02 (run before make backtest)
+fetch-vix: _guard-docker _guard-venv
+	cd backend && $(abspath $(PYTHON)) -m data.fetch_vix
 
 ## shell-db: Open an interactive psql session inside kairos_db
 shell-db:

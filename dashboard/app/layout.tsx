@@ -1,6 +1,8 @@
 import type { Metadata } from "next";
 import { Geist, JetBrains_Mono } from "next/font/google";
 import { Providers } from "@/components/providers";
+import { AppSidebar } from "@/components/app-sidebar";
+import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar";
 import "./globals.css";
 
 const geist = Geist({
@@ -29,18 +31,16 @@ export default function RootLayout({
       className={`${geist.variable} ${jetbrainsMono.variable} h-full antialiased dark`}
     >
       <body className="min-h-full flex flex-col">
-        <div
-          style={{
-            position: "relative",
-            zIndex: 1,
-            flex: 1,
-            display: "flex",
-            flexDirection: "column",
-            backgroundColor: "var(--background-color)",
-          }}
-        >
-          <Providers>{children}</Providers>
-        </div>
+        <Providers>
+          <SidebarProvider>
+            <AppSidebar />
+            <SidebarInset className="flex flex-col flex-1 min-w-0">
+              <main className="flex-1 px-6 py-8">
+                {children}
+              </main>
+            </SidebarInset>
+          </SidebarProvider>
+        </Providers>
       </body>
     </html>
   );

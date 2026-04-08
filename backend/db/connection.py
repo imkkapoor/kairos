@@ -1234,3 +1234,246 @@ def get_latest_close_prices(tickers: list[str]) -> dict[str, float]:
     with engine.connect() as conn:
         rows = conn.execute(query, {"tickers": tickers}).fetchall()
     return {row[0]: float(row[1]) for row in rows}
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.5: VIX data
+# ---------------------------------------------------------------------------
+
+def insert_vix_data(rows: list[dict]) -> int:
+    """Bulk upsert VIX close rows into vix_data. Returns rows actually inserted.
+
+    Each dict must have 'time' (UTC-aware datetime) and 'close' (float).
+    Source defaults to 'yfinance'. ON CONFLICT DO NOTHING — safe to re-run.
+    """
+    if not rows:
+        return 0
+
+    data = [
+        (
+            r["time"] if hasattr(r["time"], "tzinfo") else r["time"],
+            float(r["close"]),
+            r.get("source", "yfinance"),
+        )
+        for r in rows
+    ]
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            result = psycopg2.extras.execute_values(
+                cur,
+                """
+                INSERT INTO vix_data (time, close, source)
+                VALUES %s
+                ON CONFLICT (time) DO NOTHING
+                RETURNING time
+                """,
+                data,
+                fetch=True,
+            )
+            return len(result)
+
+
+def get_vix_range(start_date, end_date) -> pd.Series:
+    """Return VIX daily close as a pd.Series indexed by UTC-midnight Timestamps.
+
+    Parameters
+    ----------
+    start_date, end_date:
+        date or datetime objects for the inclusive range.
+
+    Returns
+    -------
+    pd.Series indexed by UTC Timestamps (midnight), values = VIX close.
+    Forward-fills weekends / holidays (same pattern as fx_rates).
+    Returns empty Series if no data exists for the range.
+    """
+    engine = get_engine()
+    from datetime import timedelta as _td
+    end_exclusive = end_date + _td(days=1)
+    query = text(
+        """
+        SELECT time, close
+        FROM vix_data
+        WHERE time >= :start_dt AND time < :end_dt
+        ORDER BY time ASC
+        """
+    )
+    df = pd.read_sql(
+        query,
+        engine,
+        params={"start_dt": start_date, "end_dt": end_exclusive},
+        parse_dates=["time"],
+    )
+    if df.empty:
+        return pd.Series(dtype=float)
+
+    df["time"] = pd.to_datetime(df["time"], utc=True).dt.normalize()
+    df = df.set_index("time")["close"]
+    df = df.groupby(df.index).last()  # keep last per day
+
+    # Reindex over full calendar range and forward-fill weekends/holidays
+    full_range = pd.date_range(
+        start=pd.Timestamp(start_date, tz="UTC"),
+        end=pd.Timestamp(end_date, tz="UTC"),
+        freq="D",
+    )
+    df = df.reindex(full_range).ffill().bfill()
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: backtest results
+# ---------------------------------------------------------------------------
+
+def insert_backtest_result(result: dict) -> int:
+    """Insert one row into backtest_results. Returns the new row id.
+
+    result must contain all required columns. config is serialised as JSONB.
+    Supports optional Phase 4.5 keys: use_vol_filter, avg_vix, pct_days_elevated.
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO backtest_results (
+                    run_id, config_name, config, window_start, window_end, window_index,
+                    total_trades, win_rate, avg_win_pct, avg_loss_pct,
+                    profit_factor, cagr, sharpe_ratio, calmar_ratio,
+                    max_drawdown, final_value_usd, total_pnl_usd,
+                    annualized_vol, currency, notes,
+                    use_vol_filter, avg_vix, pct_days_elevated
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s,
+                    %s, %s, %s, %s,
+                    %s, %s, %s,
+                    %s, %s, %s,
+                    %s, %s, %s
+                ) RETURNING id
+                """,
+                (
+                    result.get("run_id"),
+                    result["config_name"],
+                    json.dumps(result["config"]),
+                    result["window_start"],
+                    result["window_end"],
+                    result["window_index"],
+                    result["total_trades"],
+                    result.get("win_rate"),
+                    result.get("avg_win_pct"),
+                    result.get("avg_loss_pct"),
+                    result.get("profit_factor"),
+                    result.get("cagr"),
+                    result.get("sharpe_ratio"),
+                    result.get("calmar_ratio"),
+                    result.get("max_drawdown"),
+                    result.get("final_value_usd"),
+                    result.get("total_pnl_usd"),
+                    result.get("annualized_vol"),
+                    result.get("currency", "USD"),
+                    result.get("notes"),
+                    bool(result.get("use_vol_filter", False)),
+                    result.get("avg_vix"),
+                    result.get("pct_days_elevated"),
+                ),
+            )
+            row = cur.fetchone()
+            return row[0]
+
+
+def get_backtest_summary(run_id: Optional[str] = None) -> pd.DataFrame:
+    """Return aggregate WFA metrics grouped by config_name, ordered by avg Sharpe DESC.
+
+    If run_id is provided, only rows from that execution batch are included.
+    """
+    engine = get_engine()
+    if run_id:
+        query = text(
+            """
+            SELECT
+                config_name,
+                AVG(sharpe_ratio)    AS avg_sharpe,
+                AVG(calmar_ratio)    AS avg_calmar,
+                AVG(cagr)            AS avg_cagr,
+                AVG(max_drawdown)    AS avg_max_dd,
+                AVG(win_rate)        AS avg_win_rate,
+                COUNT(*)             AS windows_tested,
+                SUM(total_pnl_usd)   AS total_pnl
+            FROM backtest_results
+            WHERE run_id = :rid
+            GROUP BY config_name
+            ORDER BY avg_sharpe DESC NULLS LAST
+            """
+        )
+        return pd.read_sql(query, engine, params={"rid": run_id})
+    query = text(
+        """
+        SELECT
+            config_name,
+            AVG(sharpe_ratio)    AS avg_sharpe,
+            AVG(calmar_ratio)    AS avg_calmar,
+            AVG(cagr)            AS avg_cagr,
+            AVG(max_drawdown)    AS avg_max_dd,
+            AVG(win_rate)        AS avg_win_rate,
+            COUNT(*)             AS windows_tested,
+            SUM(total_pnl_usd)   AS total_pnl
+        FROM backtest_results
+        GROUP BY config_name
+        ORDER BY avg_sharpe DESC NULLS LAST
+        """
+    )
+    return pd.read_sql(query, engine)
+
+
+def get_backtest_results(
+    config_name: Optional[str] = None,
+    run_id: Optional[str] = None,
+) -> pd.DataFrame:
+    """Return rows from backtest_results, optionally filtered by config_name and/or run_id."""
+    engine = get_engine()
+    conditions: list[str] = []
+    params: dict = {}
+    if config_name:
+        conditions.append("config_name = :cn")
+        params["cn"] = config_name
+    if run_id:
+        conditions.append("run_id = :rid")
+        params["rid"] = run_id
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    return pd.read_sql(
+        text(f"SELECT * FROM backtest_results {where} ORDER BY config_name, window_index ASC"),
+        engine,
+        params=params or None,
+    )
+
+
+def get_backtest_run_list() -> pd.DataFrame:
+    """Return one row per distinct run_id with aggregated metrics, ordered most-recent first."""
+    engine = get_engine()
+    return pd.read_sql(
+        text(
+            """
+            SELECT
+                run_id::text                                              AS run_id,
+                MIN(run_at)                                               AS run_at,
+                array_agg(DISTINCT config_name ORDER BY config_name)      AS configs,
+                COUNT(*)::int                                             AS total_windows,
+                SUM(total_trades)::int                                    AS total_trades,
+                AVG(sharpe_ratio)                                         AS avg_sharpe,
+                AVG(cagr)                                                 AS avg_cagr,
+                AVG(max_drawdown)                                         AS avg_max_dd,
+                AVG(win_rate)                                             AS avg_win_rate,
+                SUM(total_pnl_usd)                                        AS total_pnl_usd,
+                AVG(
+                    total_pnl_usd / NULLIF(final_value_usd - total_pnl_usd, 0)
+                )                                                         AS avg_pnl_pct,
+                MIN(currency)                                             AS currency
+            FROM backtest_results
+            WHERE run_id IS NOT NULL
+            GROUP BY run_id
+            ORDER BY run_at DESC
+            """
+        ),
+        engine,
+    )

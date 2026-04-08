@@ -1,12 +1,16 @@
 "use client";
 
+import { useState } from "react";
+
 import { DataTable } from "@/components/ui/data-table";
 import { useDashboard } from "@/lib/api/queries";
 import { PositionsTableSkeleton } from "./positions-table-skeleton";
 import { positionsColumns, type PositionRow } from "./columns";
+import { TickerDrawer } from "./ticker-drawer";
 
 export function PositionsTable() {
   const { data: dashboardData, isLoading, isError, error } = useDashboard();
+  const [selectedPosition, setSelectedPosition] = useState<PositionRow | null>(null);
 
   if (isError) throw error;
   if (isLoading || !dashboardData) return <PositionsTableSkeleton />;
@@ -18,16 +22,23 @@ export function PositionsTable() {
   );
 
   return (
-    <DataTable
-      columns={positionsColumns}
-      data={rows}
-      filters={[
-        {
-          type: "search",
-          columnId: "ticker",
-          placeholder: "Filter ticker…",
-        },
-      ]}
-    />
+    <>
+      <DataTable
+        columns={positionsColumns}
+        data={rows}
+        filters={[
+          {
+            type: "search",
+            columnId: "ticker",
+            placeholder: "Filter ticker…",
+          },
+        ]}
+        onRowClick={(row) => setSelectedPosition(row)}
+      />
+      <TickerDrawer
+        position={selectedPosition}
+        onClose={() => setSelectedPosition(null)}
+      />
+    </>
   );
 }

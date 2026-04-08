@@ -246,8 +246,8 @@ _ET_JOBS = [
     (14, 0,  True,  _job_intraday_management),
     (15, 0,  True,  _job_intraday_management),
     (15, 58, True,  _job_intraday_management),
-    (17, 0,  True,  _job_update_all),
-    (17, 15, True,  _job_strategy_scan),
+    (16, 2,  True,  _job_update_all),
+    (16, 15, True,  _job_strategy_scan),
 ]
 
 
@@ -301,7 +301,7 @@ def main() -> None:
         "Scheduler running. "
         "ET jobs: 07:00 digest (P6), 09:31 morning execution, "
         "10:00-15:58 intraday management (hourly), "
-        "17:00 fetch, 17:15 scan. "
+        "16:02 fetch, 16:15 scan. "
         "Hourly health check active. "
         "Press Ctrl+C to stop."
     )

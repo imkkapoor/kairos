@@ -87,9 +87,6 @@ CREATE TABLE IF NOT EXISTS trades (
     fill_type       TEXT             -- 'Normal Fill' | 'Capped to Max Size' | 'Partial Fill' | 'Capped & Partial'
 );
 
--- Idempotent migration: add fill_type to pre-existing tables.
-ALTER TABLE trades ADD COLUMN IF NOT EXISTS fill_type TEXT;
-
 -- ---------------------------------------------------------------------------
 -- portfolio_snapshots: point-in-time portfolio state (hypertable)
 -- ---------------------------------------------------------------------------
@@ -147,3 +144,50 @@ CREATE TABLE IF NOT EXISTS fetch_log (
     notes           TEXT,
     fetch_time      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- ---------------------------------------------------------------------------
+-- backtest_results: walk-forward analysis window results (Phase 4)
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS backtest_results (
+    id              SERIAL PRIMARY KEY,
+    run_at          TIMESTAMPTZ      NOT NULL DEFAULT NOW(),
+    run_id          UUID,                         -- groups all windows from one make-backtest execution
+    config_name     TEXT             NOT NULL,
+    config          JSONB,
+    window_start    DATE             NOT NULL,
+    window_end      DATE             NOT NULL,
+    window_index    INTEGER          NOT NULL,
+    total_trades    INTEGER,
+    win_rate        DOUBLE PRECISION,
+    avg_win_pct     DOUBLE PRECISION,
+    avg_loss_pct    DOUBLE PRECISION,
+    profit_factor   DOUBLE PRECISION,
+    cagr            DOUBLE PRECISION,
+    sharpe_ratio    DOUBLE PRECISION,
+    calmar_ratio    DOUBLE PRECISION,
+    max_drawdown    DOUBLE PRECISION,
+    final_value_usd DOUBLE PRECISION,
+    total_pnl_usd   DOUBLE PRECISION,
+    annualized_vol  DOUBLE PRECISION,
+    currency        TEXT             NOT NULL DEFAULT 'USD',
+    notes           TEXT
+);
+
+-- Phase 4.5: vol filter columns (idempotent — safe to run on existing DBs)
+ALTER TABLE backtest_results ADD COLUMN IF NOT EXISTS use_vol_filter   BOOLEAN          DEFAULT FALSE;
+ALTER TABLE backtest_results ADD COLUMN IF NOT EXISTS avg_vix          DOUBLE PRECISION;
+ALTER TABLE backtest_results ADD COLUMN IF NOT EXISTS pct_days_elevated DOUBLE PRECISION;
+
+-- ---------------------------------------------------------------------------
+-- vix_data: daily VIX close prices for volatility regime filtering (Phase 4.5)
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS vix_data (
+    time   TIMESTAMPTZ      NOT NULL,
+    close  DOUBLE PRECISION NOT NULL,
+    source TEXT             NOT NULL DEFAULT 'yfinance',
+    CONSTRAINT vix_data_unique UNIQUE (time)
+);
+
+SELECT create_hypertable('vix_data', 'time', if_not_exists => TRUE);
+
+CREATE INDEX IF NOT EXISTS idx_vix_data_time ON vix_data (time DESC);

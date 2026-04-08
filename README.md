@@ -1,30 +1,32 @@
 # Kairos — Algorithmic Paper Trading System
 
-Monorepo Python + Next.js system running 5 trading strategies on ~560 US (S&P 500) and Canadian (TSX 60) equities using paper money. Self-simulated in TimescaleDB — no broker account needed. Every trade is logged with a plain-English reason.
+Monorepo Python + Next.js system running 5 trading strategies on ~600 US (S&P 500) and Canadian (TSX 60) equities using paper money. Self-simulated in TimescaleDB — no broker account needed. Every trade is logged with a plain-English reason.
 
-See [Allocation.md](Allocation.md) for the full breakdown of signal strength, z-score normalisation, and position sizing.
+See [ALLOCATION.md](ALLOCATION.md) for the full breakdown of signal strength, z-score normalisation, and position sizing.
 
 ---
 
 ## Tech Stack
 
-| Layer      | Technology                                      |
-|------------|-------------------------------------------------|
-| Data store | TimescaleDB (PostgreSQL 16 + time-series ext.)  |
-| Backend    | Python 3.13+, pandas, pandas-ta, yfinance       |
-| Scheduler  | `schedule` + `zoneinfo` (ET-aware)              |
-| Dashboard  | Next.js 15 (Phase 6)                            |
-| Container  | Docker Compose (DB only — Python runs locally)  |
+| Layer      | Technology                                            |
+|------------|-------------------------------------------------------|
+| Data store | TimescaleDB (PostgreSQL 16 + time-series ext.)        |
+| Backend    | Python 3.13+, pandas, pandas-ta, yfinance, matplotlib |
+| Scheduler  | `schedule` + `zoneinfo` (ET-aware)                   |
+| Dashboard  | Next.js 15 (Phase 6)                                  |
+| Container  | Docker Compose (DB only — Python runs locally)        |
 
 ---
 
 ## First-Time Setup
 
 ```bash
-make install   # create backend/.venv and install dependencies
-make up        # start TimescaleDB container (kairos_db)
-make setup     # init schema, seed ~560 tickers, backfill 5yr OHLCV
-make run       # start the weekday scheduler
+make install            # create backend/.venv and install all dependencies
+make up                 # start TimescaleDB container (kairos_db)
+make setup              # init schema, seed ~600 tickers, backfill 10yr OHLCV
+make hydrate-fx         # backfill USDCAD FX rates from 2017
+make hydrate-indicators # compute indicators for every historical bar (needed for backtesting)
+make run                # start the weekday scheduler
 ```
 
 ---
@@ -70,26 +72,117 @@ make fetch              # incremental OHLCV update
 make scan               # indicators + signal scan
 make simulate           # morning execution (9:31 bar)
 make simulate-evening   # evening position management
+make backtest           # WFA backtest — all 5 allocation configs
+make backtest-config CONFIG=regime_adaptive  # single config
+```
+
+---
+
+## Phase 4 — Walk-Forward Analysis Backtesting
+
+Kairos tests how different **allocation configs** (strategy weight combinations) perform across ~18 independent out-of-sample periods spanning 10 years of market history.
+
+### What `make backtest` does — step by step
+
+1. **Pre-flight** — ping DB, verify row counts in `price_data`, `indicators`, `fx_rates`
+2. **Generate 18 WFA windows** — each window has a 2-year training period and a 6-month out-of-sample test period. Windows step forward by 6 months so the test periods never overlap
+3. **Load data once** — for each config, all OHLCV, indicators, and CADUSD rates for the full date range are loaded into memory in a single DB round-trip
+4. **Per-window simulation** — for each of the 18 test windows, the engine replays history day by day:
+   - At **Open**: check stop-loss and take-profit exits (same logic as live `run_morning`)
+   - Run all **5 strategy functions** from `strategies/` (the live code, unmodified)
+   - Apply **config weights** and **regime overrides** to signal strength
+   - **Z-score sort** across all signals by strategy group (same as live scanner)
+   - Execute new trades with **ATR-based position sizing**, exposure caps, sector caps
+   - Record end-of-day portfolio value using **Close** prices
+5. **Compute metrics** per window — Sharpe ratio, Calmar ratio, CAGR, max drawdown, win rate, profit factor, annualised volatility
+6. **Store to DB** — one row per config per window in `backtest_results`
+7. **Generate 4 charts** per config → `backend/backtesting/output/`
+8. **Print summary table** — all 5 configs ranked by avg Sharpe across all 18 windows
+
+### WFA Pipeline
+
+```mermaid
+flowchart TD
+    A["make backtest"] --> B["Pre-flight checks\n(ping DB, verify data counts)"]
+    B --> C["generate_wfa_windows()\n18 windows × 6-month steps\n2017-03 → 2026-03"]
+    C --> D["get_watchlist() → ~600 tickers\nget_sector_map()"]
+    D --> E{"For each of\n5 allocation configs"}
+
+    E --> F["load_ohlcv() + load_indicators()\n+ load_fx_rates()\nFull range loaded ONCE"]
+
+    F --> G{"For each of\n18 WFA windows"}
+
+    G --> H["Slice data to\ntest window + 20-day buffer"]
+
+    H --> I{"For each\ntrading day"}
+
+    I --> J["Check open positions\nStop-loss / Take-profit\nat today's Open price"]
+    J --> K["Run all 5 strategy functions\nRSI · Momentum · MACD\nReversal · Sector Rotation"]
+    K --> L["Apply config weights\n+ regime overrides\nto signal strength"]
+    L --> M["Z-score sort\n(population std, ±3.0 clamp)\nFilter by min_strength"]
+    M --> N["Execute BUY trades\nFill at Open · ATR sizing\nExposure + sector caps"]
+    N --> O["Record equity value\nat today's Close → equity_curve"]
+    O --> I
+
+    I --> P["Compute metrics\nSharpe · Calmar · CAGR\nMax DD · Win rate"]
+    P --> Q["insert_backtest_result()\ninto backtest_results table"]
+    Q --> G
+
+    G --> R["generate_all_charts()\nEquity curves · Heatmap\nDrawdown · Comparison"]
+    R --> S["Print summary table\nranked by Avg Sharpe"]
+    S --> E
+```
+
+### Key Design Decisions
+
+| Decision | Rationale |
+|---|---|
+| Live strategy functions called directly | No reimplementation risk — if live strategies change, backtests automatically reflect it |
+| Fill at Open, value at Close | Matches live `run_morning` — no look-ahead bias |
+| Data loaded once per config | ~600 tickers × 10yr loaded in one DB query per table — ~3x faster than per-window loading |
+| USDCAD inverted to CADUSD | DB stores USDCAD (1 USD = X CAD); backtester inverts to multiply native CAD prices → USD |
+| Config as JSONB in DB | Every result is fully reproducible — the exact weights used are stored alongside the metrics |
+| Training window not used for tuning | Configs are fixed upfront. The training window only provides indicators context for regime detection |
+
+### Allocation Configs
+
+| Config | Strategy bias | Min strength | Max positions |
+|---|---|---|---|
+| `equal_weight` | All strategies 1.0 | 0.10 | 20 |
+| `momentum_heavy` | Momentum 1.5×, RSI 0.5× | 0.10 | 20 |
+| `regime_adaptive` | Boosts each strategy in its best regime | 0.10 | 20 |
+| `conservative` | Tighter filters, fewer positions | 0.15 | 15 |
+| `aggressive` | Lower bar, more positions | 0.05 | 25 |
+
+Results in `backtest_results` table. Query with `make shell-db`:
+```sql
+SELECT config_name, ROUND(AVG(sharpe_ratio)::numeric, 2) AS avg_sharpe,
+       ROUND(AVG(cagr)*100::numeric, 1) AS avg_cagr_pct
+FROM backtest_results GROUP BY config_name ORDER BY avg_sharpe DESC;
 ```
 
 ---
 
 ## Makefile Targets
 
-| Target             | Description                                                    |
-|--------------------|----------------------------------------------------------------|
-| `install`          | Create `backend/.venv`, install requirements                   |
-| `up`               | Start TimescaleDB container                                    |
-| `down`             | Stop the container                                             |
-| `logs`             | Stream Docker container logs                                   |
-| `setup`            | Init schema, seed watchlist, backfill 5yr OHLCV                |
-| `run`              | Start the weekday scheduler                                    |
-| `fetch`            | One-off incremental OHLCV update                               |
-| `scan`             | One-off signal scan                                            |
-| `simulate`         | Morning execution (9:31 bar prices + FX)                       |
-| `simulate-evening` | Evening management (DB close prices, stop/TP checks)           |
-| `shell-db`         | Open `psql` session                                            |
-| `reset-db`         | **DESTRUCTIVE** — wipe all data and recreate the database      |
+| Target                | Description                                                         |
+|-----------------------|---------------------------------------------------------------------|
+| `install`             | Create `backend/.venv`, install requirements                        |
+| `up`                  | Start TimescaleDB container                                         |
+| `down`                | Stop the container                                                  |
+| `logs`                | Stream Docker container logs                                        |
+| `setup`               | Init schema, seed watchlist, backfill 10yr OHLCV                    |
+| `run`                 | Start the weekday scheduler                                         |
+| `fetch`               | One-off incremental OHLCV update                                    |
+| `scan`                | One-off signal scan                                                 |
+| `simulate`            | Morning execution (9:31 bar prices + FX)                            |
+| `simulate-evening`    | Evening management (DB close prices, stop/TP checks)                |
+| `hydrate-indicators`  | Backfill full historical indicators for all tickers (for backtesting)|
+| `hydrate-fx`          | Backfill USDCAD FX rates from 2017                                  |
+| `backtest`            | WFA backtest across all 5 allocation configs (~18 windows each)     |
+| `backtest-config`     | WFA backtest for one config — `CONFIG=regime_adaptive`              |
+| `shell-db`            | Open `psql` session                                                 |
+| `reset-db`            | **DESTRUCTIVE** — wipe all data and recreate the database           |
 
 ---
 
@@ -99,29 +192,36 @@ make simulate-evening   # evening position management
 kairos/
 ├── backend/
 │   ├── db/
-│   │   ├── init.sql            ← schema (auto-run by Docker on first start)
-│   │   └── connection.py       ← ONLY file that reads/writes the DB
+│   │   ├── init.sql                ← schema (auto-run by Docker on first start)
+│   │   └── connection.py           ← ONLY file that reads/writes the DB
 │   ├── data/
-│   │   ├── fetcher.py          ← yfinance downloader with rate limiting
-│   │   └── hydrate_fx_rates.py ← backfill USDCAD/CADUSD from 2017
+│   │   ├── fetcher.py              ← yfinance downloader with rate limiting
+│   │   ├── hydrate_fx_rates.py     ← backfill USDCAD from 2017
+│   │   └── hydrate_indicators.py   ← backfill full historical indicators (Phase 4)
 │   ├── strategies/
-│   │   ├── scanner.py          ← daily scan orchestrator
-│   │   ├── indicators.py       ← technical indicator computation
-│   │   ├── regime.py           ← market regime detection (ADX + SPY crisis)
-│   │   ├── rsi.py              ← mean reversion
-│   │   ├── momentum.py         ← MA crossover + trend following
-│   │   ├── macd.py             ← MACD + ADX crossover
-│   │   ├── reversal.py         ← short-term reversal (Jegadeesh 1990)
-│   │   └── sector_rotation.py  ← ETF-based macro regime rotation
+│   │   ├── scanner.py              ← daily scan orchestrator
+│   │   ├── indicators.py           ← technical indicator computation (latest bar)
+│   │   ├── regime.py               ← market regime detection (ADX + SPY crisis)
+│   │   ├── rsi.py                  ← mean reversion
+│   │   ├── momentum.py             ← MA crossover + trend following
+│   │   ├── macd.py                 ← MACD + ADX crossover
+│   │   ├── reversal.py             ← short-term reversal (Jegadeesh 1990)
+│   │   └── sector_rotation.py      ← ETF-based macro regime rotation
 │   ├── simulator/
-│   │   ├── simulator.py        ← morning + evening job orchestrator
-│   │   ├── executor.py         ← signal → trade, price + FX fetch
-│   │   ├── portfolio.py        ← in-memory portfolio with risk limits
-│   │   └── position_manager.py ← stop/TP/trailing stop checker
-│   ├── scheduler.py            ← long-running weekday job runner
-│   ├── setup.py                ← one-time init script
+│   │   ├── simulator.py            ← morning + evening job orchestrator
+│   │   ├── executor.py             ← signal → trade, price + FX fetch
+│   │   ├── portfolio.py            ← in-memory portfolio with risk limits
+│   │   └── position_manager.py     ← stop/TP/trailing stop checker
+│   ├── backtesting/
+│   │   ├── config.py               ← WFA params + 5 allocation configs
+│   │   ├── data_loader.py          ← DB data loading + WFA window generation
+│   │   ├── portfolio_runner.py     ← day-by-day simulation engine
+│   │   ├── charts.py               ← matplotlib charts → backtesting/output/
+│   │   └── run_backtest.py         ← CLI entry point (make backtest)
+│   ├── scheduler.py                ← long-running weekday job runner
+│   ├── setup.py                    ← one-time init script
 │   └── .env.example
-├── dashboard/                  ← Phase 6 (Next.js)
+├── dashboard/                      ← Phase 6 (Next.js)
 ├── docker-compose.yml
 ├── Makefile
 └── README.md
@@ -136,16 +236,17 @@ Or: `make shell-db`
 
 ### Tables
 
-| Table                 | Type       | Description                                   |
-|-----------------------|------------|-----------------------------------------------|
-| `price_data`          | hypertable | OHLCV bars (daily + intraday)                 |
-| `indicators`          | hypertable | Computed technical indicators per ticker/day  |
-| `signals`             | regular    | Strategy signals with strength + z_score      |
-| `trades`              | regular    | Paper trades with fill price, SL, TP, FX rate |
-| `portfolio_snapshots` | hypertable | Point-in-time portfolio state (CAD)           |
-| `watchlist`           | regular    | Universe of tracked tickers                   |
-| `fx_rates`            | hypertable | Daily USDCAD / CADUSD rates                   |
-| `fetch_log`           | regular    | Audit log for every yfinance fetch             |
+| Table                 | Type       | Description                                        |
+|-----------------------|------------|----------------------------------------------------|
+| `price_data`          | hypertable | OHLCV bars (daily + intraday)                      |
+| `indicators`          | hypertable | Computed technical indicators per ticker/day       |
+| `signals`             | regular    | Strategy signals with strength + z_score           |
+| `trades`              | regular    | Paper trades with fill price, SL, TP, FX rate      |
+| `portfolio_snapshots` | hypertable | Point-in-time portfolio state (CAD)                |
+| `watchlist`           | regular    | Universe of tracked tickers                        |
+| `fx_rates`            | hypertable | Daily USDCAD rates                                 |
+| `fetch_log`           | regular    | Audit log for every yfinance fetch                 |
+| `backtest_results`    | regular    | WFA results — one row per config per window        |
 
 **Indicators computed:** `rsi_14`, `ma_50`, `ma_200`, `ema_20`, `bb_upper/mid/lower`, `atr_14`, `adx_14`, `volume_sma`, `macd_line`, `macd_signal`, `macd_hist`, `roc_20`
 
@@ -193,9 +294,8 @@ All strategies are regime-filtered (TRENDING / CHOPPY / CRISIS) and volume-confi
 | 3     | Paper trade simulator | ✅ Complete |
 | 4     | Backtesting engine    | ⬜ Pending  |
 | 5     | Risk analytics        | ⬜ Pending  |
-| 6     | Dashboard (Next.js)   | ⬜ Pending  |
-| 5     | AI / sentiment layer   | ⬜ Pending  |
-| 6     | Dashboard + notifier   | ⬜ Pending  |
+| 6     | AI / sentiment layer   | ⬜ Pending  |
+| 7     | Dashboard + notifier   | ⬜ Pending  |
 
 ---
 
