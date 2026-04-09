@@ -306,8 +306,20 @@ def run_window(
 
     # Phase 4.5: vol filter state
     use_vol = config.get("use_vol_filter", False)
+    vroc_window    = config.get("vroc_window",    10)
+    vroc_threshold = config.get("vroc_threshold", 0.20)
     vix_day_values: list[float] = []
     elevated_day_count: int = 0
+    spike_day_count: int = 0
+
+    # Phase 4.7: circuit breaker state
+    use_circuit_breaker = config.get("use_circuit_breaker", False)
+    dd_trigger = config.get("dd_trigger", 0.15)
+    dd_reset   = config.get("dd_reset",   0.10)
+    cb_peak_value = INITIAL_CAPITAL
+    circuit_breaker_active = False
+    breaker_active_day_count: int = 0
+    circuit_breaker_days: list[bool] = []
 
     # Build sorted list of trading days within test window using SPY as calendar
     ref_ticker = "SPY" if "SPY" in ohlcv else next(iter(ohlcv), None)
@@ -406,18 +418,37 @@ def run_window(
             pnl_pct = pnl / cost_usd if cost_usd > 0 else 0.0
             trade_log.append({"ticker": ticker, "pnl_usd": pnl, "pnl_pct": pnl_pct, "exit_type": exit_type})
 
+        # ── 8a. Circuit breaker state update (after exits, before new buys) ─
+        if use_circuit_breaker:
+            cb_val = portfolio.get_total_value(open_prices, fx_today)
+            current_dd = (cb_peak_value - cb_val) / cb_peak_value if cb_peak_value > 0 else 0.0
+            cb_peak_value = max(cb_peak_value, cb_val)
+            if current_dd >= dd_trigger:
+                circuit_breaker_active = True
+            elif current_dd < dd_reset:
+                circuit_breaker_active = False
+            if circuit_breaker_active:
+                breaker_active_day_count += 1
+        circuit_breaker_days.append(circuit_breaker_active)
+
         # ── 9. Open position tickers (after exits) ────────────────────────
         open_tickers = list(portfolio.positions.keys())
 
         # ── 9a. Vol filter state for today ────────────────────────────────
         if use_vol and vix_series is not None and not vix_series.empty:
-            vol_state = get_vix_regime(day_date, vix_series)
+            vol_state = get_vix_regime(
+                day_date, vix_series,
+                sma_window=vroc_window,
+                vroc_threshold=vroc_threshold,
+            )
             size_mult = vol_state["size_mult"]
             suppressed_strategies = vol_state["suppressed"]
             if vol_state["vix"] is not None:
                 vix_day_values.append(vol_state["vix"])
             if vol_state["regime"] in ("HIGH", "EXTREME"):
                 elevated_day_count += 1
+            if vol_state.get("spike_triggered"):
+                spike_day_count += 1
         else:
             size_mult = 1.0
             suppressed_strategies: set[str] = set()
@@ -467,6 +498,10 @@ def run_window(
             key=lambda s: (s.get("z_score", 0.0), s["strength"]),
             reverse=True,
         )
+
+        # ── 13a. Circuit breaker: suppress all BUY signals ───────────────
+        if use_circuit_breaker and circuit_breaker_active:
+            buy_signals = []
 
         # ── 14. Execute trades ────────────────────────────────────────────
         just_opened: set[str] = set()
@@ -571,15 +606,30 @@ def run_window(
 
     metrics = _compute_metrics(trade_log, equity_curve, test_start, test_end, portfolio.initial_capital)
 
-    # Phase 4.5: vol filter summary metrics
+    # Phase 4.5 / 4.6: vol filter summary metrics
     metrics["use_vol_filter"] = use_vol
     n_days = len(trading_days)
     if use_vol and vix_series is not None and not vix_series.empty:
-        metrics["avg_vix"] = float(np.mean(vix_day_values)) if vix_day_values else None
+        metrics["avg_vix"]           = float(np.mean(vix_day_values)) if vix_day_values else None
         metrics["pct_days_elevated"] = elevated_day_count / n_days if n_days > 0 else None
+        metrics["pct_days_spike"]    = spike_day_count / n_days if n_days > 0 else None
+        metrics["vroc_window"]       = vroc_window
+        metrics["vroc_threshold"]    = vroc_threshold
     else:
-        metrics["avg_vix"] = None
+        metrics["avg_vix"]           = None
         metrics["pct_days_elevated"] = None
+        metrics["pct_days_spike"]    = None
+        metrics["vroc_window"]       = None
+        metrics["vroc_threshold"]    = None
+
+    # Phase 4.7: circuit breaker metrics
+    metrics["use_circuit_breaker"]     = use_circuit_breaker
+    metrics["dd_trigger"]              = dd_trigger if use_circuit_breaker else None
+    metrics["dd_reset"]                = dd_reset if use_circuit_breaker else None
+    metrics["pct_days_breaker_active"] = (
+        breaker_active_day_count / n_days if (use_circuit_breaker and n_days > 0) else None
+    )
+    metrics["circuit_breaker_days"]    = circuit_breaker_days  # per-day list, not persisted to DB
 
     return metrics
 
@@ -605,10 +655,19 @@ def _empty_metrics(test_start: date, test_end: date) -> dict:
         "total_pnl_usd":   0.0,
         "annualized_vol":  None,
         "equity_curve":    [],
-        # Phase 4.5 vol filter fields
+        # Phase 4.5 / 4.6 vol filter fields
         "use_vol_filter":    False,
         "avg_vix":           None,
         "pct_days_elevated": None,
+        "pct_days_spike":    None,
+        "vroc_window":       None,
+        "vroc_threshold":    None,
+        # Phase 4.7 circuit breaker fields
+        "use_circuit_breaker":     False,
+        "dd_trigger":              None,
+        "dd_reset":                None,
+        "pct_days_breaker_active": None,
+        "circuit_breaker_days":    [],
     }
 
 

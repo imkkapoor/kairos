@@ -212,6 +212,194 @@ def _print_vol_filter_impact(baseline: str = "live_default") -> None:
 
 
 # ---------------------------------------------------------------------------
+# VROC comparison table
+# ---------------------------------------------------------------------------
+
+def _print_vroc_comparison(
+    baseline: str = "vol_filtered_regime_adaptive",
+    vroc_cfg: str = "vol_adaptive_vroc",
+) -> None:
+    """Print per-window comparison: baseline vs vol_adaptive_vroc."""
+    from db.connection import get_backtest_results
+
+    base_df = get_backtest_results(config_name=baseline)
+    vroc_df = get_backtest_results(config_name=vroc_cfg)
+
+    if base_df.empty or vroc_df.empty:
+        return
+
+    merged = base_df.merge(
+        vroc_df[["window_index", "sharpe_ratio", "max_drawdown", "pct_days_spike"]],
+        on="window_index",
+        suffixes=("_base", "_vroc"),
+    ).sort_values("window_index")
+
+    if merged.empty:
+        return
+
+    print()
+    print(f"  VROC Comparison \u2014 {baseline} vs {vroc_cfg}")
+    print("  " + "-" * 82)
+    hdr = (
+        f"  {'Window':>7} | {'Baseline Sharpe':>15} | {'VROC Sharpe':>11} | "
+        f"{'Baseline MaxDD':>14} | {'VROC MaxDD':>10} | {'% Days Spike':>12}"
+    )
+    print(hdr)
+    print("  " + "-" * 82)
+
+    HIGHLIGHT = {3, 7}
+    sh_bases, sh_vrocs, dd_bases, dd_vrocs, spikes = [], [], [], [], []
+
+    for _, row in merged.iterrows():
+        wi   = int(row["window_index"])
+        sh_b = row.get("sharpe_ratio_base")
+        sh_v = row.get("sharpe_ratio_vroc")
+        dd_b = row.get("max_drawdown_base")
+        dd_v = row.get("max_drawdown_vroc")
+        spk  = row.get("pct_days_spike_vroc")
+
+        sh_b_s = f"{sh_b:.3f}" if sh_b is not None else "N/A"
+        sh_v_s = f"{sh_v:.3f}" if sh_v is not None else "N/A"
+        dd_b_s = f"{dd_b*100:.1f}%" if dd_b is not None else "N/A"
+        dd_v_s = f"{dd_v*100:.1f}%" if dd_v is not None else "N/A"
+        spk_s  = f"{spk*100:.0f}%" if spk is not None else "N/A"
+
+        marker = " *" if wi in HIGHLIGHT else ""
+        print(
+            f"  {f'W{wi:02d}'+marker:>7} | {sh_b_s:>15} | {sh_v_s:>11} | "
+            f"{dd_b_s:>14} | {dd_v_s:>10} | {spk_s:>12}"
+        )
+
+        if sh_b is not None: sh_bases.append(sh_b)
+        if sh_v is not None: sh_vrocs.append(sh_v)
+        if dd_b is not None: dd_bases.append(dd_b)
+        if dd_v is not None: dd_vrocs.append(dd_v)
+        if spk  is not None: spikes.append(spk)
+
+    if sh_bases and sh_vrocs:
+        import numpy as _np
+        print("  " + "-" * 82)
+        avg_spk = f"{_np.mean(spikes)*100:.0f}%" if spikes else "N/A"
+        print(
+            f"  {'Overall':>7} | {_np.mean(sh_bases):>15.3f} | {_np.mean(sh_vrocs):>11.3f} | "
+            f"{_np.mean(dd_bases)*100:>13.1f}% | {_np.mean(dd_vrocs)*100:>9.1f}% | {avg_spk:>12}"
+        )
+        print("  (* = target windows: W03 2020-H1, W07 2022-H1)")
+    print("=" * 68)
+
+
+# ---------------------------------------------------------------------------
+# Circuit breaker comparison table
+# ---------------------------------------------------------------------------
+
+def _print_cb_comparison(
+    no_cb: str = "vol_adaptive_vroc",
+    cb_full: str = "vol_adaptive_full",
+    cb_tight: str = "vol_adaptive_tight_cb",
+) -> None:
+    """Print per-window comparison: no CB vs CB-15% vs CB-10%."""
+    from db.connection import get_backtest_results
+    import numpy as _np
+
+    no_cb_df  = get_backtest_results(config_name=no_cb)
+    full_df   = get_backtest_results(config_name=cb_full)
+    tight_df  = get_backtest_results(config_name=cb_tight)
+
+    if no_cb_df.empty and full_df.empty:
+        return
+
+    # Merge all three on window_index
+    base = no_cb_df[["window_index", "sharpe_ratio", "max_drawdown"]].rename(
+        columns={"sharpe_ratio": "sh_nocb", "max_drawdown": "dd_nocb"}
+    )
+    if not full_df.empty:
+        base = base.merge(
+            full_df[["window_index", "sharpe_ratio", "max_drawdown", "pct_days_breaker_active"]].rename(
+                columns={"sharpe_ratio": "sh_full", "max_drawdown": "dd_full",
+                         "pct_days_breaker_active": "act_full"}
+            ),
+            on="window_index", how="outer",
+        )
+    if not tight_df.empty:
+        base = base.merge(
+            tight_df[["window_index", "sharpe_ratio", "max_drawdown", "pct_days_breaker_active"]].rename(
+                columns={"sharpe_ratio": "sh_tight", "max_drawdown": "dd_tight",
+                         "pct_days_breaker_active": "act_tight"}
+            ),
+            on="window_index", how="outer",
+        )
+
+    base = base.sort_values("window_index")
+    if base.empty:
+        return
+
+    print()
+    print("  Circuit Breaker Comparison \u2014 No CB vs CB-15% vs CB-10%")
+    print("  " + "-" * 100)
+    hdr = (
+        f"  {'Window':>7} | {'No CB Sharpe':>12} | {'CB-15 Sharpe':>12} | {'CB-10 Sharpe':>12}"
+        f" | {'No CB MaxDD':>11} | {'CB-15 MaxDD':>11} | {'CB-10 MaxDD':>11}"
+        f" | {'CB-15 %Active':>13} | {'CB-10 %Active':>13}"
+    )
+    print(hdr)
+    print("  " + "-" * 100)
+
+    TARGET = {3, 7, 14}
+    sh_nocbs, sh_fulls, sh_tights = [], [], []
+    dd_nocbs, dd_fulls, dd_tights = [], [], []
+    act_fulls, act_tights = [], []
+
+    for _, row in base.iterrows():
+        wi = int(row["window_index"])
+
+        sh_n = row.get("sh_nocb");  sh_f = row.get("sh_full");   sh_t = row.get("sh_tight")
+        dd_n = row.get("dd_nocb");  dd_f = row.get("dd_full");   dd_t = row.get("dd_tight")
+        af   = row.get("act_full"); at_  = row.get("act_tight")
+
+        sh_n_s = f"{sh_n:.3f}" if sh_n is not None else " N/A"
+        sh_f_s = f"{sh_f:.3f}" if sh_f is not None else " N/A"
+        sh_t_s = f"{sh_t:.3f}" if sh_t is not None else " N/A"
+        dd_n_s = f"{dd_n*100:.1f}%" if dd_n is not None else " N/A"
+        dd_f_s = f"{dd_f*100:.1f}%" if dd_f is not None else " N/A"
+        dd_t_s = f"{dd_t*100:.1f}%" if dd_t is not None else " N/A"
+        af_s   = f"{af*100:.0f}%"   if af  is not None else " N/A"
+        at_s   = f"{at_*100:.0f}%"  if at_ is not None else " N/A"
+
+        marker = " *" if wi in TARGET else ""
+        print(
+            f"  {f'W{wi:02d}'+marker:>7} | {sh_n_s:>12} | {sh_f_s:>12} | {sh_t_s:>12}"
+            f" | {dd_n_s:>11} | {dd_f_s:>11} | {dd_t_s:>11}"
+            f" | {af_s:>13} | {at_s:>13}"
+        )
+
+        if sh_n is not None: sh_nocbs.append(sh_n)
+        if sh_f is not None: sh_fulls.append(sh_f)
+        if sh_t is not None: sh_tights.append(sh_t)
+        if dd_n is not None: dd_nocbs.append(dd_n)
+        if dd_f is not None: dd_fulls.append(dd_f)
+        if dd_t is not None: dd_tights.append(dd_t)
+        if af  is not None: act_fulls.append(af)
+        if at_ is not None: act_tights.append(at_)
+
+    print("  " + "-" * 100)
+    sh_n_avg = f"{_np.mean(sh_nocbs):.3f}"  if sh_nocbs  else " N/A"
+    sh_f_avg = f"{_np.mean(sh_fulls):.3f}"  if sh_fulls  else " N/A"
+    sh_t_avg = f"{_np.mean(sh_tights):.3f}" if sh_tights else " N/A"
+    dd_n_avg = f"{_np.mean(dd_nocbs)*100:.1f}%"  if dd_nocbs  else " N/A"
+    dd_f_avg = f"{_np.mean(dd_fulls)*100:.1f}%"  if dd_fulls  else " N/A"
+    dd_t_avg = f"{_np.mean(dd_tights)*100:.1f}%"  if dd_tights else " N/A"
+    af_avg   = f"{_np.mean(act_fulls)*100:.0f}%"  if act_fulls  else " N/A"
+    at_avg   = f"{_np.mean(act_tights)*100:.0f}%" if act_tights else " N/A"
+    print(
+        f"  {'Overall':>7} | {sh_n_avg:>12} | {sh_f_avg:>12} | {sh_t_avg:>12}"
+        f" | {dd_n_avg:>11} | {dd_f_avg:>11} | {dd_t_avg:>11}"
+        f" | {af_avg:>13} | {at_avg:>13}"
+    )
+    print("  (* = worst DD windows: W03 2020-H1, W07 2022-H1, W14 2025-H2)")
+    print("=" * 68)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -293,7 +481,7 @@ def main() -> None:
         # Store to DB — each config gets its own run_id
         run_id = str(uuid.uuid4())
         for res in win_results:
-            db_row = {k: v for k, v in res.items() if k != "equity_curve"}
+            db_row = {k: v for k, v in res.items() if k not in ("equity_curve", "circuit_breaker_days")}
             db_row["currency"] = currency
             db_row["run_id"]   = run_id
             insert_backtest_result(db_row)
@@ -316,18 +504,32 @@ def main() -> None:
     # 9. Vol filter impact table (only shown when vol configs are present)
     _print_vol_filter_impact()
 
+    # 10. VROC comparison table (only shown when both configs are present)
+    _print_vroc_comparison()
+
+    # 11. Circuit breaker comparison table
+    _print_cb_comparison()
+
     print("""
---- KAIROS PHASE 4.5 BACKTEST COMPLETE ---
-  classify_vix(): pure function, 4 regimes, size_mult 1.0/0.65/0.35/0.0
-  get_vix_regime(): series lookup with fail-open fallback
-  Suppression sets: ELEVATED={reversal}, HIGH={reversal,sector_rotation,macd},
-                    EXTREME=all strategies
+--- KAIROS PHASE 4.7 COMPLETE ---
+Modified: backtesting/portfolio_runner.py
+  Circuit breaker: tracks rolling peak_value per window
+  Activates at dd_trigger (default 15%), resets at dd_reset (default 10%)
+  Blocks BUY signals only — exits always run
+  peak_value and breaker state reset per WFA window
+  pct_days_breaker_active stored in result dict
 
-  New backtest configs: vol_filtered_default, vol_filtered_conservative
-  New charts: vol_filter_comparison.png, drawdown_improvement.png, vix_regime_timeline.png
+New configs: vol_adaptive_full, vol_adaptive_tight_cb
+New charts: circuit_breaker_comparison.png, {config}_equity_breaker.png
+New DB columns: use_circuit_breaker, dd_trigger, dd_reset, pct_days_breaker_active
 
-  Live simulator: NOT touched. vol_regime.py ready for future import by executor.py.
---- END PHASE 4.5 ---
+Overfitting checks:
+  pct_days_breaker_active in W01/W09/W10 should be < 10%
+  Sharpe drop in W01/W09/W10 vs vol_adaptive_vroc should be < 0.10
+  tight_cb active days should be < 2x full_cb on average
+
+-> If vol_adaptive_full passes overfitting checks, wire into executor.py next
+--- END PHASE 4.7 SUMMARY ---
 """)
 
 

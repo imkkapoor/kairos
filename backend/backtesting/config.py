@@ -211,4 +211,106 @@ CONFIGS: dict[str, dict] = {
         "max_sector_exposure": 0.30,
         "use_vol_filter":      True,
     },
+
+    # Phase 4.6: vol_filtered_regime_adaptive + VROC spike trigger
+    # Apples-to-apples vs vol_filtered_regime_adaptive — only difference is
+    # the spike trigger. Run this config to isolate the VROC contribution.
+    "vol_adaptive_vroc": {
+        "strategy_weights": {
+            "rsi":             1.0,
+            "momentum":        1.0,
+            "macd":            0.8,
+            "reversal":        0.6,
+            "sector_rotation": 0.5,
+        },
+        "regime_overrides": {
+            "trending": {
+                "momentum":        1.3,
+                "macd":            1.2,
+                "sector_rotation": 1.0,
+                "rsi":             0.3,
+                "reversal":        0.3,
+            },
+            "choppy": {
+                "rsi":             1.3,
+                "reversal":        1.2,
+                "sector_rotation": 0.8,
+                "macd":            0.4,
+                "momentum":        0.2,
+            },
+            "crisis": {
+                "reversal":        1.5,
+                "rsi":             0.5,
+                "sector_rotation": 0.3,
+                "macd":            0.1,
+                "momentum":        0.1,
+            },
+        },
+        "min_strength":        0.10,
+        "max_open_positions":  20,
+        "max_sector_exposure": 0.30,
+        "use_vol_filter":      True,
+        "vroc_window":         10,
+        "vroc_threshold":      0.20,
+    },
+
+    # Phase 4.7: vol_adaptive_vroc + circuit breaker — full risk stack
+    "vol_adaptive_full": {
+        "strategy_weights": {
+            "rsi":             1.0,
+            "momentum":        1.0,
+            "macd":            0.8,
+            "reversal":        0.6,
+            "sector_rotation": 0.5,
+        },
+        "regime_overrides": {
+            "trending": {
+                "momentum": 1.3,
+                "rsi":      0.3,
+            },
+            "choppy": {
+                "rsi":      1.3,
+                "momentum": 0.2,
+            },
+        },
+        "min_strength":         0.10,
+        "max_open_positions":   20,
+        "max_sector_exposure":  0.30,
+        "use_vol_filter":       True,
+        "vroc_window":          10,
+        "vroc_threshold":       0.20,
+        "use_circuit_breaker":  True,
+        "dd_trigger":           0.15,
+        "dd_reset":             0.10,
+    },
+
+    # Phase 4.7: tighter circuit breaker (10% trigger) — overfitting check
+    "vol_adaptive_tight_cb": {
+        "strategy_weights": {
+            "rsi":             1.0,
+            "momentum":        1.0,
+            "macd":            0.8,
+            "reversal":        0.6,
+            "sector_rotation": 0.5,
+        },
+        "regime_overrides": {
+            "trending": {
+                "momentum": 1.3,
+                "rsi":      0.3,
+            },
+            "choppy": {
+                "rsi":      1.3,
+                "momentum": 0.2,
+            },
+        },
+        "min_strength":         0.10,
+        "max_open_positions":   20,
+        "max_sector_exposure":  0.30,
+        "use_vol_filter":       True,
+        "vroc_window":          10,
+        "vroc_threshold":       0.20,
+        "use_circuit_breaker":  True,
+        "dd_trigger":           0.10,
+        "dd_reset":             0.07,
+    },
 }

@@ -279,6 +279,30 @@ def generate_all_charts(
         import warnings
         warnings.warn(f"Vol filter charts skipped: {exc}")
 
+    # Phase 4.6: VROC comparison chart
+    try:
+        paths.append(plot_vroc_comparison())
+    except Exception as exc:
+        import warnings
+        warnings.warn(f"VROC chart skipped: {exc}")
+
+    # Phase 4.7: circuit breaker comparison chart
+    try:
+        paths.append(plot_circuit_breaker_comparison())
+    except Exception as exc:
+        import warnings
+        warnings.warn(f"Circuit breaker comparison chart skipped: {exc}")
+
+    # Phase 4.7: per-config equity curves with breaker overlay
+    CB_CONFIGS = {"vol_adaptive_full", "vol_adaptive_tight_cb"}
+    for config_name, results in all_results.items():
+        if config_name in CB_CONFIGS:
+            try:
+                paths.append(plot_equity_curves_with_breaker(results, config_name))
+            except Exception as exc:
+                import warnings
+                warnings.warn(f"Equity breaker chart for {config_name} skipped: {exc}")
+
     return paths
 
 
@@ -512,6 +536,332 @@ def plot_vix_regime_timeline(config_name: str = "vol_filtered_default") -> Path:
     fig.tight_layout()
 
     out_path = out_dir / "vix_regime_timeline.png"
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.6: VROC spike comparison chart
+# ---------------------------------------------------------------------------
+
+def plot_vroc_comparison(
+    baseline: str = "vol_filtered_regime_adaptive",
+    vroc: str = "vol_adaptive_vroc",
+) -> Path:
+    """Side-by-side bars comparing vol_filtered_regime_adaptive vs vol_adaptive_vroc.
+
+    Top subplot: Sharpe / MaxDD / CAGR per WFA window, baseline vs VROC config.
+    Red background band on W03 (2020-H1) and W07 (2022-H1) — target spike windows.
+
+    Bottom subplot: pct_days_spike per window for the VROC config only, showing
+    what fraction of each window the spike trigger was active.
+
+    Saves: output/vroc_comparison.png
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+    from db.connection import get_backtest_results
+
+    out_dir = _ensure_output_dir()
+
+    base_df = get_backtest_results(config_name=baseline)
+    vroc_df = get_backtest_results(config_name=vroc)
+
+    if base_df.empty or vroc_df.empty:
+        fig, ax = plt.subplots(figsize=(10, 4))
+        ax.text(
+            0.5, 0.5,
+            f"No data for '{baseline}' or '{vroc}'.\n"
+            "Run: make backtest-config CONFIG=vol_adaptive_vroc",
+            ha="center", va="center", transform=ax.transAxes, fontsize=11,
+        )
+        ax.set_title("VROC comparison — no data yet")
+        out_path = out_dir / "vroc_comparison.png"
+        fig.savefig(out_path, dpi=150)
+        plt.close(fig)
+        return out_path
+
+    merged = base_df.merge(
+        vroc_df[["window_index", "sharpe_ratio", "max_drawdown", "cagr", "pct_days_spike"]],
+        on="window_index",
+        suffixes=("_base", "_vroc"),
+    ).sort_values("window_index")
+
+    if merged.empty:
+        fig, ax = plt.subplots(figsize=(10, 4))
+        ax.text(0.5, 0.5, "No overlapping windows between configs",
+                ha="center", va="center", transform=ax.transAxes)
+        out_path = out_dir / "vroc_comparison.png"
+        fig.savefig(out_path, dpi=150)
+        plt.close(fig)
+        return out_path
+
+    n_wins   = len(merged)
+    x        = np.arange(n_wins)
+    width    = 0.35
+    win_idxs = merged["window_index"].tolist()
+    HIGHLIGHT = {3, 7}
+
+    metrics = [
+        ("sharpe_ratio", "Sharpe Ratio"),
+        ("max_drawdown", "Max Drawdown"),
+        ("cagr",         "CAGR"),
+    ]
+
+    fig, axes = plt.subplots(
+        2, 3, figsize=(16, 9),
+        gridspec_kw={"height_ratios": [3, 1.5]},
+    )
+    fig.suptitle(
+        f"VROC Spike Comparison: {baseline} vs {vroc} \u2014 per WFA window",
+        fontsize=13, fontweight="bold",
+    )
+
+    # Top row: one subplot per metric
+    for ax, (col, label) in zip(axes[0], metrics):
+        base_vals = merged[f"{col}_base"].fillna(0).values
+        vroc_vals = merged[f"{col}_vroc"].fillna(0).values
+
+        for i, wi in enumerate(win_idxs):
+            if wi in HIGHLIGHT:
+                ax.axvspan(i - 0.5, i + 0.5, color="#FFCCCC", alpha=0.55, zorder=0)
+
+        ax.bar(x - width / 2, base_vals, width, label=baseline,  color="#4C72B0", alpha=0.85)
+        ax.bar(x + width / 2, vroc_vals, width, label=vroc, color="#2ca02c", alpha=0.85)
+        ax.set_title(label)
+        ax.set_xticks(x)
+        ax.set_xticklabels([f"W{wi}" for wi in win_idxs], fontsize=8)
+        ax.axhline(0, color="grey", linewidth=0.6)
+        ax.legend(fontsize=7)
+
+    # Bottom row: pct_days_spike for VROC config (3 subplots share same data)
+    spike_vals = (merged["pct_days_spike_vroc"].fillna(0).values * 100
+                  if "pct_days_spike_vroc" in merged.columns
+                  else np.zeros(n_wins))
+
+    for j, ax in enumerate(axes[1]):
+        bars = ax.bar(x, spike_vals, color="#e67e22", alpha=0.75)
+        for i, wi in enumerate(win_idxs):
+            if wi in HIGHLIGHT:
+                ax.axvspan(i - 0.5, i + 0.5, color="#FFCCCC", alpha=0.45, zorder=0)
+        ax.set_xticks(x)
+        ax.set_xticklabels([f"W{wi}" for wi in win_idxs], fontsize=8)
+        ax.set_ylabel("% Days Spike" if j == 0 else "")
+        ax.set_title("Spike Trigger Active (% of window days)" if j == 0 else "")
+        ax.yaxis.set_major_formatter(
+            plt.FuncFormatter(lambda v, _: f"{v:.0f}%")
+        )
+        ax.bar_label(bars, fmt="%.0f%%", padding=2, fontsize=7)
+        if j > 0:
+            ax.set_visible(False)
+
+    # Make bottom-row axes 1 and 2 invisible (only first one carries the chart)
+    axes[1][1].set_visible(False)
+    axes[1][2].set_visible(False)
+
+    # Re-layout bottom subplot to span full width
+    # (gridspec adjustment — simple approach: hide, accept 3-column layout)
+
+    red_patch   = mpatches.Patch(color="#FFCCCC", alpha=0.7, label="Target windows (W03, W07)")
+    orange_patch = mpatches.Patch(color="#e67e22", alpha=0.75, label="% days spike active")
+    fig.legend(
+        handles=[red_patch, orange_patch],
+        loc="lower center", ncol=2, fontsize=9, bbox_to_anchor=(0.5, 0.01),
+    )
+
+    fig.tight_layout(rect=[0, 0.05, 1, 1])
+    out_path = out_dir / "vroc_comparison.png"
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.7: Circuit breaker comparison charts
+# ---------------------------------------------------------------------------
+
+def plot_circuit_breaker_comparison(
+    no_cb: str = "vol_adaptive_vroc",
+    cb_full: str = "vol_adaptive_full",
+    cb_tight: str = "vol_adaptive_tight_cb",
+) -> Path:
+    """Grouped bar chart comparing three configs across all WFA windows.
+
+    Top subplot: max_drawdown per window for all 3 configs.
+    Bottom subplot: pct_days_breaker_active per window for the two CB configs.
+
+    Red background band on W03, W07, W14 (worst drawdown windows).
+    Saves: output/circuit_breaker_comparison.png
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+    from db.connection import get_backtest_results
+
+    out_dir = _ensure_output_dir()
+
+    no_cb_df    = get_backtest_results(config_name=no_cb)
+    full_df     = get_backtest_results(config_name=cb_full)
+    tight_df    = get_backtest_results(config_name=cb_tight)
+
+    if no_cb_df.empty and full_df.empty and tight_df.empty:
+        fig, ax = plt.subplots(figsize=(10, 4))
+        ax.text(
+            0.5, 0.5,
+            f"No data for circuit breaker configs.\nRun: make backtest-config CONFIG={cb_full}",
+            ha="center", va="center", transform=ax.transAxes, fontsize=11,
+        )
+        ax.set_title("Circuit breaker comparison — no data yet")
+        out_path = out_dir / "circuit_breaker_comparison.png"
+        fig.savefig(out_path, dpi=150)
+        plt.close(fig)
+        return out_path
+
+    # Build a combined window_index list from all available configs
+    all_wins = sorted(set(
+        list(no_cb_df["window_index"].tolist() if not no_cb_df.empty else []) +
+        list(full_df["window_index"].tolist()  if not full_df.empty  else []) +
+        list(tight_df["window_index"].tolist() if not tight_df.empty else [])
+    ))
+    n_wins = len(all_wins)
+    x = np.arange(n_wins)
+    width = 0.25
+    HIGHLIGHT = {3, 7, 14}
+
+    def _get_vals(df: pd.DataFrame, col: str) -> np.ndarray:
+        if df.empty:
+            return np.zeros(n_wins)
+        idx_map = {wi: i for i, wi in enumerate(all_wins)}
+        arr = np.zeros(n_wins)
+        for _, row in df.iterrows():
+            i = idx_map.get(int(row["window_index"]))
+            if i is not None and row.get(col) is not None:
+                arr[i] = float(row[col])
+        return arr
+
+    dd_no_cb  = _get_vals(no_cb_df,  "max_drawdown") * 100
+    dd_full   = _get_vals(full_df,   "max_drawdown") * 100
+    dd_tight  = _get_vals(tight_df,  "max_drawdown") * 100
+    act_full  = _get_vals(full_df,   "pct_days_breaker_active") * 100
+    act_tight = _get_vals(tight_df,  "pct_days_breaker_active") * 100
+
+    fig, (ax_top, ax_bot) = plt.subplots(
+        2, 1, figsize=(16, 9),
+        gridspec_kw={"height_ratios": [2, 1]},
+    )
+    fig.suptitle(
+        "Circuit Breaker Comparison: No CB vs CB-15% vs CB-10% — per WFA window",
+        fontsize=13, fontweight="bold",
+    )
+
+    # Red bands for worst windows
+    for ax in (ax_top, ax_bot):
+        for i, wi in enumerate(all_wins):
+            if wi in HIGHLIGHT:
+                ax.axvspan(i - 0.5, i + 0.5, color="#FFCCCC", alpha=0.45, zorder=0)
+
+    # Top: max drawdown
+    b1 = ax_top.bar(x - width,     dd_no_cb, width, label=f"{no_cb} (No CB)",   color="#4C72B0", alpha=0.85)
+    b2 = ax_top.bar(x,             dd_full,  width, label=f"{cb_full} (CB-15%)", color="#DD8452", alpha=0.85)
+    b3 = ax_top.bar(x + width,     dd_tight, width, label=f"{cb_tight} (CB-10%)", color="#C44E52", alpha=0.85)
+    ax_top.set_xticks(x)
+    ax_top.set_xticklabels([f"W{wi}" for wi in all_wins], fontsize=9)
+    ax_top.set_ylabel("Max Drawdown (%)")
+    ax_top.set_title("Max Drawdown per WFA Window")
+    ax_top.axhline(0, color="grey", linewidth=0.6)
+    ax_top.legend(fontsize=9)
+    ax_top.bar_label(b1, fmt="%.1f%%", padding=2, fontsize=7)
+    ax_top.bar_label(b2, fmt="%.1f%%", padding=2, fontsize=7)
+    ax_top.bar_label(b3, fmt="%.1f%%", padding=2, fontsize=7)
+
+    # Bottom: pct_days_breaker_active
+    b4 = ax_bot.bar(x - width / 2, act_full,  width, label=f"{cb_full} (CB-15%)", color="#DD8452", alpha=0.85)
+    b5 = ax_bot.bar(x + width / 2, act_tight, width, label=f"{cb_tight} (CB-10%)", color="#C44E52", alpha=0.85)
+    ax_bot.set_xticks(x)
+    ax_bot.set_xticklabels([f"W{wi}" for wi in all_wins], fontsize=9)
+    ax_bot.set_ylabel("% Days Breaker Active")
+    ax_bot.set_title("Circuit Breaker Activation Rate — Overfitting Check (W01/W09/W10 should be <10%)")
+    ax_bot.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v:.0f}%"))
+    ax_bot.axhline(10, color="red", linewidth=0.8, linestyle="--", alpha=0.6, label="10% threshold")
+    ax_bot.legend(fontsize=9)
+    ax_bot.bar_label(b4, fmt="%.0f%%", padding=2, fontsize=7)
+    ax_bot.bar_label(b5, fmt="%.0f%%", padding=2, fontsize=7)
+
+    red_patch = mpatches.Patch(color="#FFCCCC", alpha=0.7, label="Target windows (W03, W07, W14)")
+    fig.legend(handles=[red_patch], loc="lower center", fontsize=9, bbox_to_anchor=(0.5, 0.01))
+
+    fig.tight_layout(rect=[0, 0.04, 1, 1])
+    out_path = out_dir / "circuit_breaker_comparison.png"
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
+
+
+def plot_equity_curves_with_breaker(
+    results: list[dict],
+    config_name: str = "vol_adaptive_full",
+) -> Path:
+    """Overlay equity curves per WFA window with red shading where circuit breaker fired.
+
+    One line per window. Red shaded regions indicate days where circuit_breaker_active=True.
+    Saves: output/{config_name}_equity_breaker.png
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib.cm as cm
+
+    out_dir = _ensure_output_dir()
+    fig, ax = plt.subplots(figsize=(14, 6))
+
+    cmap   = cm.get_cmap("tab20")
+    n_wins = len(results)
+
+    for i, res in enumerate(results):
+        curve   = res.get("equity_curve", [])
+        cb_days = res.get("circuit_breaker_days", [])
+        if len(curve) < 2:
+            continue
+
+        dates  = [d for d, _ in curve]
+        values = [v for _, v in curve]
+        color  = cmap(i / max(n_wins - 1, 1))
+        wi     = res.get("window_index", i + 1)
+        start  = curve[0][0]
+
+        ax.plot(range(len(values)), values, color=color, linewidth=1.2,
+                label=f"W{wi} ({start})", alpha=0.85)
+
+        # Shade regions where circuit breaker was active
+        if cb_days:
+            in_region = False
+            region_start = 0
+            for j, active in enumerate(cb_days):
+                if active and not in_region:
+                    region_start = j
+                    in_region = True
+                elif not active and in_region:
+                    ax.axvspan(region_start, j, color="#FF4444", alpha=0.08, zorder=0)
+                    in_region = False
+            if in_region:
+                ax.axvspan(region_start, len(cb_days) - 1, color="#FF4444", alpha=0.08, zorder=0)
+
+    ax.axhline(
+        y=_first_capital(results), color="grey", linestyle="--",
+        linewidth=0.8, label="Initial capital",
+    )
+
+    import matplotlib.patches as mpatches
+    red_patch = mpatches.Patch(color="#FF4444", alpha=0.3, label="Circuit breaker active")
+    handles, labels = ax.get_legend_handles_labels()
+    handles.append(red_patch)
+    labels.append("Circuit breaker active")
+
+    ax.set_title(f"{config_name} — Equity curves with circuit breaker regions ({n_wins} windows)")
+    ax.set_xlabel("Trading days within window")
+    ax.set_ylabel("Portfolio value (USD)")
+    ax.legend(handles=handles, labels=labels, fontsize=7, ncol=3, loc="best")
+    fig.tight_layout()
+
+    out_path = out_dir / f"{config_name}_equity_breaker.png"
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
     return out_path

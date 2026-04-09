@@ -178,6 +178,17 @@ ALTER TABLE backtest_results ADD COLUMN IF NOT EXISTS use_vol_filter   BOOLEAN  
 ALTER TABLE backtest_results ADD COLUMN IF NOT EXISTS avg_vix          DOUBLE PRECISION;
 ALTER TABLE backtest_results ADD COLUMN IF NOT EXISTS pct_days_elevated DOUBLE PRECISION;
 
+-- Phase 4.6: VROC spike columns (idempotent — safe to run on existing DBs)
+ALTER TABLE backtest_results ADD COLUMN IF NOT EXISTS vroc_window      INTEGER          DEFAULT 10;
+ALTER TABLE backtest_results ADD COLUMN IF NOT EXISTS vroc_threshold   DOUBLE PRECISION DEFAULT 0.20;
+ALTER TABLE backtest_results ADD COLUMN IF NOT EXISTS pct_days_spike   DOUBLE PRECISION;
+
+-- Phase 4.7: circuit breaker columns (idempotent — safe to run on existing DBs)
+ALTER TABLE backtest_results ADD COLUMN IF NOT EXISTS use_circuit_breaker      BOOLEAN          DEFAULT FALSE;
+ALTER TABLE backtest_results ADD COLUMN IF NOT EXISTS dd_trigger               DOUBLE PRECISION DEFAULT 0.15;
+ALTER TABLE backtest_results ADD COLUMN IF NOT EXISTS dd_reset                 DOUBLE PRECISION DEFAULT 0.10;
+ALTER TABLE backtest_results ADD COLUMN IF NOT EXISTS pct_days_breaker_active  DOUBLE PRECISION;
+
 -- ---------------------------------------------------------------------------
 -- vix_data: daily VIX close prices for volatility regime filtering (Phase 4.5)
 -- ---------------------------------------------------------------------------

@@ -1331,6 +1331,8 @@ def insert_backtest_result(result: dict) -> int:
 
     result must contain all required columns. config is serialised as JSONB.
     Supports optional Phase 4.5 keys: use_vol_filter, avg_vix, pct_days_elevated.
+    Supports optional Phase 4.6 keys: vroc_window, vroc_threshold, pct_days_spike.
+    Supports optional Phase 4.7 keys: use_circuit_breaker, dd_trigger, dd_reset, pct_days_breaker_active.
     """
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -1342,14 +1344,18 @@ def insert_backtest_result(result: dict) -> int:
                     profit_factor, cagr, sharpe_ratio, calmar_ratio,
                     max_drawdown, final_value_usd, total_pnl_usd,
                     annualized_vol, currency, notes,
-                    use_vol_filter, avg_vix, pct_days_elevated
+                    use_vol_filter, avg_vix, pct_days_elevated,
+                    vroc_window, vroc_threshold, pct_days_spike,
+                    use_circuit_breaker, dd_trigger, dd_reset, pct_days_breaker_active
                 ) VALUES (
                     %s, %s, %s, %s, %s, %s,
                     %s, %s, %s, %s,
                     %s, %s, %s, %s,
                     %s, %s, %s,
                     %s, %s, %s,
-                    %s, %s, %s
+                    %s, %s, %s,
+                    %s, %s, %s,
+                    %s, %s, %s, %s
                 ) RETURNING id
                 """,
                 (
@@ -1376,6 +1382,13 @@ def insert_backtest_result(result: dict) -> int:
                     bool(result.get("use_vol_filter", False)),
                     result.get("avg_vix"),
                     result.get("pct_days_elevated"),
+                    result.get("vroc_window"),
+                    result.get("vroc_threshold"),
+                    result.get("pct_days_spike"),
+                    bool(result.get("use_circuit_breaker", False)),
+                    result.get("dd_trigger"),
+                    result.get("dd_reset"),
+                    result.get("pct_days_breaker_active"),
                 ),
             )
             row = cur.fetchone()
