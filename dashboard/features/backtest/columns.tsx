@@ -125,7 +125,11 @@ export const backtestColumns: ColumnDef<BacktestRun>[] = [
   },
   {
     accessorKey: "total_pnl_usd",
-    header: "P&L (USD)",
+    header: ({ table }) => {
+      const firstRow = table.getCoreRowModel().rows[0]?.original as BacktestRun | undefined;
+      const currency = firstRow?.currency ?? "Portfolio Currency";
+      return `P&L (${currency})`;
+    },
     enableSorting: true,
     cell: ({ row }) => usd(row.getValue("total_pnl_usd")),
   },

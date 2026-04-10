@@ -2,13 +2,18 @@
 
 This document describes how signal **strength** is computed, how **z-scores**
 normalise across the daily universe, and how **position size** is determined
-inside the walk-forward backtester (`backtesting/portfolio_runner.py`).
+inside the rolling out-of-sample (ROOS) backtester (`backtesting/portfolio_runner.py`).
 
-It extends `ALLOCATION.md` (live simulator) by adding the **Phase 4.5 VIX
-volatility regime filter**. Sections 1–8 and the core formulas are identical
-to the live system. The VIX layer (Section 9) and the modified execution flow
-(Sections 10–11) are backtest-specific — the live executor does **not** yet
-use `vol_regime.py` (scheduled for a future phase).
+It extends `ALLOCATION.md` (live simulator) with the full backtesting risk
+stack built across Phases 4.5 – 4.8:
+
+- **Phase 4.5** — VIX volatility regime filter (Section 9)
+- **Phase 4.6** — VROC spike trigger (Section 9.4)
+- **Phase 4.7** — Binary drawdown circuit breaker (Section 9.5)
+- **Phase 4.8** — Soft CB + vol-adjusted reset + crisis position limits + dollar floor (Section 9.6)
+
+Sections 1–8 and the core signal formulas are identical to the live system.
+The live executor does **not** yet use `vol_regime.py` — that wiring is a future phase.
 
 ---
 
@@ -272,7 +277,7 @@ and either zeroes out entire strategy families or scales down position sizing.
 
 ### 9.1 VIX regime classification (`classify_vix`)
 
-Pure function — no DB calls. Called once per trading day per WFA window.
+Pure function — no DB calls. Called once per trading day per ROOS window.
 
 | VIX close | Regime   | `size_mult` | Rationale                                  |
 |-----------|----------|-------------|-------------------------------------------|
@@ -307,7 +312,7 @@ opening is near-zero at VIX ≥ 40.
 ### 9.3 Data loading and fallback
 
 `backtesting/data_loader.load_vix()` loads the full VIX series from `vix_data`
-**once per WFA window** — never once per trading day. The series is
+**once per ROOS window** — never once per trading day. The series is
 forward-filled over weekends and holidays (same pattern as FX rates).
 
 Fallback chain in `get_vix_regime()`:
@@ -317,6 +322,100 @@ Fallback chain in `get_vix_regime()`:
 
 If `vix_data` is empty for an entire window, a warning is logged and the
 backtester defaults to NORMAL for all days (no suppression, `size_mult=1.0`).
+
+### 9.4 VROC Spike Trigger  *(Phase 4.6)*
+
+**Config keys:** `vroc_window` (default 10), `vroc_threshold` (default 0.20)
+
+The VIX SMA classification only reacts once VIX has been elevated for several
+days. The VROC trigger catches *rapid spikes* on day 1.
+
+```
+is_spike = VIX_today > VIX_SMA(vroc_window) × (1 + vroc_threshold)
+         = VIX > 10-day SMA × 1.20
+```
+
+When `is_spike=True`, the regime is **forced to at least HIGH** (size\_mult=0.35),
+even if the raw VIX would classify as ELEVATED. It never *downgrades* a regime
+(EXTREME stays EXTREME). Stored in metrics as `pct_days_spike`.
+
+Historical impact: on 2020-03-03 (day 1 of COVID selloff), VIX jumped +24% in
+one day — VROC trigger fires immediately, before the SMA fully reacts.
+
+### 9.5 Binary Drawdown Circuit Breaker  *(Phase 4.7 — legacy)*
+
+**Config keys:** `use_circuit_breaker`, `dd_trigger` (default 0.15), `dd_reset` (default 0.10)
+
+On/off switch: once the portfolio drops `dd_trigger` from its peak, **all new
+BUY signals are suppressed** until drawdown recovers below `dd_reset`.
+
+```
+circuit_breaker_active = True   when  current_dd >= dd_trigger
+circuit_breaker_active = False  when  current_dd <  dd_reset
+```
+
+Known issue: the hard on/off caused W07 (2022 rate-hike bear) Sharpe to drop
+from 0.536 → 0.223 because recovery BUYs in the second half of the window
+were blocked even after the initial drawdown stabilised. Replaced by the soft
+CB in Phase 4.8. Kept in code for backward compatibility with stored results.
+
+### 9.6 Soft Circuit Breaker + Full Risk Stack  *(Phase 4.8)*
+
+Replaces the binary CB with linear de-leveraging and adds three additional
+controls. All four are independent config flags.
+
+#### Change 1 — Soft Circuit Breaker
+
+**Config keys:** `use_soft_cb`, `cb_soft_start` (0.05), `cb_hard_stop` (0.12), `cb_min_mult` (0.25)
+
+```
+dd < cb_soft_start  (5%):   cb_mult = 1.0  (full size)
+5% ≤ dd < 12%:              cb_mult = 1.0 − (0.75 × (dd − 0.05) / 0.07)
+dd ≥ cb_hard_stop   (12%):  cb_mult = 0.0  (hard stop)
+
+effective_mult = size_mult (VIX) × cb_mult (soft CB)
+dollar_risk    = strength × MAX_PORTFOLIO_RISK × portfolio_value × effective_mult
+```
+
+The `effective_mult=0.0` path short-circuits BUY execution entirely — no
+positions are opened. SELL exits and stop-losses always run regardless.
+
+Stored in metrics: `avg_cb_mult` (mean multiplier across all days; 1.0 = never
+triggered, lower = more suppressed on average).
+
+#### Change 2 — VIX-Linked Recovery Hold
+
+After `cb_mult` drops below 1.0, a minimum hold period prevents "chatter"
+(CB bouncing on/off during a choppy recovery).
+
+```
+NORMAL   (VIX < 20):  hold 3 days  after dd returns < cb_soft_start
+ELEVATED (20–30):     hold 5 days
+HIGH     (30–40):     hold 8 days
+EXTREME  (≥ 40):      hold 12 days
+```
+
+During the hold, `cb_mult` stays at the last computed linear value rather
+than jumping back to 1.0. Stored in metrics: `pct_days_chatter_held`.
+
+#### Change 3 — Crisis Position Limits
+
+**Config keys:** `use_crisis_pos_limits`, `crisis_max_positions` (default 8)
+
+When VIX regime is HIGH or EXTREME, `max_open_positions` is dynamically
+reduced to `crisis_max_positions` for that day only. Existing positions above
+the limit are **not** force-closed — only new BUYs are blocked. This forces the
+z-score sort to allocate capital only to the highest-conviction signals during
+stress.
+
+#### Change 4 — Minimum Dollar Risk Floor
+
+**Config key:** `min_dollar_risk` (default 0)
+
+If `dollar_risk < min_dollar_risk`, the signal is silently discarded before
+position sizing. This filters out very small positions that consume a slot in
+`max_open_positions` without meaningful contribution. Stored in metrics:
+`pct_signals_below_floor`.
 
 ---
 
@@ -424,16 +523,26 @@ VIX ≥ 40 are not blocked — existing positions can still close normally.
 `False` (or omitting it) is a strict no-op — zero overhead, identical results
 to Phase 4 baseline configs.
 
-| Config                    | Weights                                   | `min_strength` | Positions | Sector cap | `use_vol_filter` |
-|---------------------------|-------------------------------------------|----------------|-----------|-----------|-----------------|
-| `live_default`            | all 1.0                                   | 0.10           | 20        | 30%       | False           |
-| `equal_weight`            | all 1.0                                   | 0.10           | 20        | 30%       | False           |
-| `momentum_heavy`          | mom 1.5, macd 1.2, rsi+rev 0.5/0.4       | 0.10           | 20        | 30%       | False           |
-| `regime_adaptive`         | all 1.0 + per-regime overrides            | 0.10           | 20        | 30%       | False           |
-| `conservative`            | rsi+mom 1.0, macd 0.8, rev 0.6, sect 0.5 | 0.15           | 15        | 25%       | False           |
-| `aggressive`              | mom 1.2, rest 1.0/0.8                    | 0.05           | 25        | 35%       | False           |
-| **`vol_filtered_default`**| all 1.0 *(= live_default)*               | 0.10           | 20        | 30%       | **True**        |
-| **`vol_filtered_conservative`** | rsi+mom 1.0, macd 0.8, rev 0.6, sect 0.5 | 0.15    | 15        | 25%       | **True**        |
+| Config | Weights | `min_str` | Pos | Sec | Vol | VROC | CB | Phase |
+|--------|---------|-----------|-----|-----|-----|------|----|-------|
+| `live_default` | all 1.0 | 0.10 | 20 | 30% | – | – | – | 4 |
+| `equal_weight` | all 1.0 | 0.10 | 20 | 30% | – | – | – | 4 |
+| `momentum_heavy` | mom 1.5, macd 1.2, rsi+rev 0.5/0.4 | 0.10 | 20 | 30% | – | – | – | 4 |
+| `regime_adaptive` | all 1.0 + per-regime overrides | 0.10 | 20 | 30% | – | – | – | 4 |
+| `conservative` | rsi+mom 1.0, macd 0.8, rev 0.6, sect 0.5 | 0.15 | 15 | 25% | – | – | – | 4 |
+| `aggressive` | mom 1.2, rest 1.0/0.8 | 0.05 | 25 | 35% | – | – | – | 4 |
+| `vol_filtered_default` | all 1.0 | 0.10 | 20 | 30% | ✓ | – | – | 4.5 |
+| `vol_filtered_conservative` | rsi+mom 1.0, macd 0.8, rev 0.6, sect 0.5 | 0.15 | 15 | 25% | ✓ | – | – | 4.5 |
+| `vol_filtered_regime_adaptive` | all 1.0 + overrides | 0.10 | 20 | 30% | ✓ | – | – | 4.5 |
+| `vol_adaptive_vroc` | conservative weights + overrides | 0.10 | 20 | 30% | ✓ | ✓ | – | 4.6 |
+| `vol_adaptive_full` | conservative weights + overrides | 0.10 | 20 | 30% | ✓ | ✓ | binary | 4.7 |
+| `vol_adaptive_tight_cb` | same (tighter CB 10% trigger) | 0.10 | 20 | 30% | ✓ | ✓ | binary | 4.7 |
+| `vol_adaptive_soft_cb` | conservative weights + overrides | 0.10 | 20 | 30% | ✓ | ✓ | soft | 4.8 |
+| `vol_adaptive_full_v2` | conservative + crisis limits + floor | 0.10 | 20 | 30% | ✓ | ✓ | soft | 4.8 |
+| `vol_adaptive_conservative_v2` | conservative + full stack | 0.15 | 12 | 20% | ✓ | ✓ | soft | 4.8 |
+| `adaptive_shield_v1` | conservative weights + overrides | 0.10 | 20 | 30% | ✓ | – | soft | Latest |
+
+*Columns: `min_str` = min\_strength, Pos = max\_open\_positions, Sec = max\_sector\_exposure, Vol = use\_vol\_filter, CB = circuit breaker type.*
 
 `vol_filtered_default` is a direct apples-to-apples comparison against
 `live_default`. Any performance difference is attributable solely to the VIX
@@ -441,7 +550,7 @@ filter.
 
 ---
 
-## 13. WFA Window Structure
+## 13. ROOS Window Structure
 
 **File:** `backtesting/config.py`, `backtesting/data_loader.py`
 
@@ -449,7 +558,7 @@ filter.
 |--------------------|----------------------------------|
 | Training window    | 2 years before each test period  |
 | Test window        | 6 months (out-of-sample)         |
-| Total windows      | ~18 (2017 → 2026)                |
+| Total windows      | 14 (2019-01 → 2026-01)           |
 | Data start         | 2017-01-09                       |
 | VIX data start     | 2017-01-02                       |
 
@@ -459,18 +568,43 @@ fit any parameters to training data.
 
 ---
 
-## 14. Per-Window Vol Filter Metrics
+## 14. Per-Window Metrics Stored in `backtest_results`
 
-For `use_vol_filter=True` configs, two additional metrics are computed per
-WFA window and stored in `backtest_results`:
+All metrics are stored as one row per config per ROOS window.
 
-| Column               | Description                                                  |
-|----------------------|--------------------------------------------------------------|
-| `avg_vix`            | Mean VIX close over all trading days in the test window      |
-| `pct_days_elevated`  | Fraction of days with regime ∈ {HIGH, EXTREME}               |
-
-These allow post-hoc analysis: windows with high `avg_vix` / `pct_days_elevated`
-are where the filter is expected to reduce drawdown.
+| Column                    | When populated                              | Description |
+|---------------------------|---------------------------------------------|-------------|
+| `total_trades`            | Always                                      | Closed trades (excl. end-of-window force-closes) |
+| `win_rate`                | Always                                      | Fraction of closed trades with PnL > 0 |
+| `avg_win_pct`             | Always                                      | Mean return of winning trades |
+| `avg_loss_pct`            | Always                                      | Mean return of losing trades |
+| `profit_factor`           | Always                                      | Total wins / total losses |
+| `cagr`                    | Always                                      | Compound annual growth rate |
+| `sharpe_ratio`            | Always                                      | Annualised return / annualised vol (rf=0) |
+| `calmar_ratio`            | Always                                      | CAGR / max drawdown |
+| `max_drawdown`            | Always                                      | Peak-to-trough equity decline |
+| `annualized_vol`          | Always                                      | Daily return std × √252 |
+| `total_pnl_usd`           | Always                                      | Final value − $100,000 |
+| `use_vol_filter`          | Always                                      | Whether VIX filter was enabled |
+| `avg_vix`                 | `use_vol_filter=True`                       | Mean VIX close over test window |
+| `pct_days_elevated`       | `use_vol_filter=True`                       | Days with regime ∈ {HIGH, EXTREME} / total |
+| `vroc_window`             | Config has `vroc_window`                    | SMA window used for VROC trigger |
+| `vroc_threshold`          | Config has `vroc_threshold`                 | VROC threshold (e.g. 0.20 = 20% above SMA) |
+| `pct_days_spike`          | `use_vol_filter=True`                       | Days where VROC spike fired / total |
+| `use_circuit_breaker`     | Always                                      | Phase 4.7 binary CB flag |
+| `dd_trigger`              | `use_circuit_breaker=True`                  | DD level that activates binary CB |
+| `dd_reset`                | `use_circuit_breaker=True`                  | DD level that deactivates binary CB |
+| `pct_days_breaker_active` | `use_circuit_breaker=True`                  | Days with CB active / total |
+| `use_soft_cb`             | Always                                      | Phase 4.8 soft CB flag |
+| `cb_soft_start`           | `use_soft_cb=True`                          | DD where linear scaling begins |
+| `cb_hard_stop`            | `use_soft_cb=True`                          | DD where all BUYs stop |
+| `cb_min_mult`             | `use_soft_cb=True`                          | Minimum multiplier before hard stop |
+| `avg_cb_mult`             | `use_soft_cb=True`                          | Mean daily cb\_mult (1.0 = never triggered) |
+| `pct_days_chatter_held`   | `use_soft_cb=True`                          | Days held in recovery mode / total |
+| `use_crisis_pos_limits`   | Always                                      | Phase 4.8 crisis limits flag |
+| `crisis_max_positions`    | `use_crisis_pos_limits=True`                | Max positions during HIGH/EXTREME |
+| `min_dollar_risk`         | Always                                      | Dollar floor for position sizing |
+| `pct_signals_below_floor` | `min_dollar_risk > 0`                       | Signals discarded by floor / total attempts |
 
 ---
 

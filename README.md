@@ -72,20 +72,20 @@ make fetch              # incremental OHLCV update
 make scan               # indicators + signal scan
 make simulate           # morning execution (9:31 bar)
 make simulate-evening   # evening position management
-make backtest           # WFA backtest — all 5 allocation configs
+make backtest           # ROOS backtest — all allocation configs
 make backtest-config CONFIG=regime_adaptive  # single config
 ```
 
 ---
 
-## Phase 4 — Walk-Forward Analysis Backtesting
+## Phase 4 — Rolling Out-of-Sample (ROOS) Backtesting (Phases 4 – 4.8)
 
-Kairos tests how different **allocation configs** (strategy weight combinations) perform across ~18 independent out-of-sample periods spanning 10 years of market history.
+Kairos tests how different **allocation configs** (strategy weight combinations) perform across 14 independent out-of-sample periods spanning ~7 years of market history (2019 → 2026).
 
 ### What `make backtest` does — step by step
 
 1. **Pre-flight** — ping DB, verify row counts in `price_data`, `indicators`, `fx_rates`
-2. **Generate 18 WFA windows** — each window has a 2-year training period and a 6-month out-of-sample test period. Windows step forward by 6 months so the test periods never overlap
+2. **Generate 14 ROOS windows** — each window has a 2-year training period and a 6-month out-of-sample test period. Windows step forward by 6 months so the test periods never overlap
 3. **Load data once** — for each config, all OHLCV, indicators, and CADUSD rates for the full date range are loaded into memory in a single DB round-trip
 4. **Per-window simulation** — for each of the 18 test windows, the engine replays history day by day:
    - At **Open**: check stop-loss and take-profit exits (same logic as live `run_morning`)
@@ -97,20 +97,20 @@ Kairos tests how different **allocation configs** (strategy weight combinations)
 5. **Compute metrics** per window — Sharpe ratio, Calmar ratio, CAGR, max drawdown, win rate, profit factor, annualised volatility
 6. **Store to DB** — one row per config per window in `backtest_results`
 7. **Generate 4 charts** per config → `backend/backtesting/output/`
-8. **Print summary table** — all 5 configs ranked by avg Sharpe across all 18 windows
+8. **Print summary table** — all configs ranked by avg Sharpe across all 14 windows
 
-### WFA Pipeline
+### ROOS Pipeline
 
 ```mermaid
 flowchart TD
     A["make backtest"] --> B["Pre-flight checks\n(ping DB, verify data counts)"]
-    B --> C["generate_wfa_windows()\n18 windows × 6-month steps\n2017-03 → 2026-03"]
+    B --> C["generate_roos_windows()\n14 windows × 6-month steps\n2019-01 → 2026-01"]
     C --> D["get_watchlist() → ~600 tickers\nget_sector_map()"]
-    D --> E{"For each of\n5 allocation configs"}
+    D --> E{"For each of\n16 allocation configs"}
 
     E --> F["load_ohlcv() + load_indicators()\n+ load_fx_rates()\nFull range loaded ONCE"]
 
-    F --> G{"For each of\n18 WFA windows"}
+    F --> G{"For each of\n14 ROOS windows"}
 
     G --> H["Slice data to\ntest window + 20-day buffer"]
 
@@ -146,13 +146,24 @@ flowchart TD
 
 ### Allocation Configs
 
-| Config | Strategy bias | Min strength | Max positions |
-|---|---|---|---|
-| `equal_weight` | All strategies 1.0 | 0.10 | 20 |
-| `momentum_heavy` | Momentum 1.5×, RSI 0.5× | 0.10 | 20 |
-| `regime_adaptive` | Boosts each strategy in its best regime | 0.10 | 20 |
-| `conservative` | Tighter filters, fewer positions | 0.15 | 15 |
-| `aggressive` | Lower bar, more positions | 0.05 | 25 |
+| Config | Strategy bias | Min strength | Max positions | Phase |
+|---|---|---|---|---|
+| `equal_weight` | All strategies 1.0 | 0.10 | 20 | 4 |
+| `momentum_heavy` | Momentum 1.5×, RSI 0.5× | 0.10 | 20 | 4 |
+| `regime_adaptive` | Per-regime overrides | 0.10 | 20 | 4 |
+| `conservative` | Tighter filters, fewer positions | 0.15 | 15 | 4 |
+| `aggressive` | Lower bar, more positions | 0.05 | 25 | 4 |
+| `live_default` | Mirrors live env-var settings | 0.10 | 20 | 4 |
+| `vol_filtered_default` | All 1.0 + VIX filter | 0.10 | 20 | 4.5 |
+| `vol_filtered_conservative` | Conservative + VIX filter | 0.15 | 15 | 4.5 |
+| `vol_filtered_regime_adaptive` | Regime adaptive + VIX filter | 0.10 | 20 | 4.5 |
+| `vol_adaptive_vroc` | Regime adaptive + VIX + VROC spike | 0.10 | 20 | 4.6 |
+| `vol_adaptive_full` | VROC + binary circuit breaker (15%) | 0.10 | 20 | 4.7 |
+| `vol_adaptive_tight_cb` | VROC + tighter circuit breaker (10%) | 0.10 | 20 | 4.7 |
+| `vol_adaptive_soft_cb` | Soft CB (linear de-lever), no crisis limits | 0.10 | 20 | 4.8 |
+| `vol_adaptive_full_v2` | Soft CB + crisis pos limits + dollar floor | 0.10 | 20 | 4.8 |
+| `vol_adaptive_conservative_v2` | Conservative + full risk stack | 0.15 | 12 | 4.8 |
+| `adaptive_shield_v1` | Streamlined soft CB + regime adaptive | 0.10 | 20 | Latest |
 
 Results in `backtest_results` table. Query with `make shell-db`:
 ```sql
@@ -174,13 +185,19 @@ FROM backtest_results GROUP BY config_name ORDER BY avg_sharpe DESC;
 | `setup`               | Init schema, seed watchlist, backfill 10yr OHLCV                    |
 | `run`                 | Start the weekday scheduler                                         |
 | `fetch`               | One-off incremental OHLCV update                                    |
+| `fetch-debug`         | Same as `fetch` with DEBUG logging                                  |
+| `retry-failed`        | Retry tickers that failed in last fetch (DATE=YYYY-MM-DD)           |
 | `scan`                | One-off signal scan                                                 |
 | `simulate`            | Morning execution (9:31 bar prices + FX)                            |
 | `simulate-evening`    | Evening management (DB close prices, stop/TP checks)                |
+| `api`                 | Start FastAPI server on port 8000 (auto-reload)                     |
+| `api-debug`           | Same as `api` with DEBUG logging                                    |
+| `dashboard`           | Start Next.js dashboard dev server on port 3000                     |
 | `hydrate-indicators`  | Backfill full historical indicators for all tickers (for backtesting)|
 | `hydrate-fx`          | Backfill USDCAD FX rates from 2017                                  |
-| `backtest`            | WFA backtest across all 5 allocation configs (~18 windows each)     |
-| `backtest-config`     | WFA backtest for one config — `CONFIG=regime_adaptive`              |
+| `fetch-vix`           | One-time VIX history backfill from 2017-01-02 (run before backtest) |
+| `backtest`            | ROOS backtest across all 16 allocation configs (~14 windows each)    |
+| `backtest-config`     | ROOS backtest for one config — `CONFIG=regime_adaptive`              |
 | `shell-db`            | Open `psql` session                                                 |
 | `reset-db`            | **DESTRUCTIVE** — wipe all data and recreate the database           |
 
@@ -197,11 +214,13 @@ kairos/
 │   ├── data/
 │   │   ├── fetcher.py              ← yfinance downloader with rate limiting
 │   │   ├── hydrate_fx_rates.py     ← backfill USDCAD from 2017
-│   │   └── hydrate_indicators.py   ← backfill full historical indicators (Phase 4)
+│   │   ├── hydrate_indicators.py   ← backfill full historical indicators (Phase 4)
+│   │   └── fetch_vix.py            ← one-time VIX history backfill from 2017 (Phase 4.5)
 │   ├── strategies/
 │   │   ├── scanner.py              ← daily scan orchestrator
 │   │   ├── indicators.py           ← technical indicator computation (latest bar)
 │   │   ├── regime.py               ← market regime detection (ADX + SPY crisis)
+│   │   ├── vol_regime.py           ← VIX regime classification + VROC spike filter (Phase 4.5)
 │   │   ├── rsi.py                  ← mean reversion
 │   │   ├── momentum.py             ← MA crossover + trend following
 │   │   ├── macd.py                 ← MACD + ADX crossover
@@ -213,15 +232,15 @@ kairos/
 │   │   ├── portfolio.py            ← in-memory portfolio with risk limits
 │   │   └── position_manager.py     ← stop/TP/trailing stop checker
 │   ├── backtesting/
-│   │   ├── config.py               ← WFA params + 5 allocation configs
-│   │   ├── data_loader.py          ← DB data loading + WFA window generation
+│   │   ├── config.py               ← ROOS params + 16 allocation configs
+│   │   ├── data_loader.py          ← DB data loading + ROOS window generation
 │   │   ├── portfolio_runner.py     ← day-by-day simulation engine
 │   │   ├── charts.py               ← matplotlib charts → backtesting/output/
 │   │   └── run_backtest.py         ← CLI entry point (make backtest)
 │   ├── scheduler.py                ← long-running weekday job runner
 │   ├── setup.py                    ← one-time init script
 │   └── .env.example
-├── dashboard/                      ← Phase 6 (Next.js)
+├── dashboard/                      ← Next.js 15 dashboard (portfolio · backtest · trades)
 ├── docker-compose.yml
 ├── Makefile
 └── README.md
@@ -245,8 +264,9 @@ Or: `make shell-db`
 | `portfolio_snapshots` | hypertable | Point-in-time portfolio state (CAD)                |
 | `watchlist`           | regular    | Universe of tracked tickers                        |
 | `fx_rates`            | hypertable | Daily USDCAD rates                                 |
+| `vix_data`            | hypertable | Daily VIX close prices from 2017 (Phase 4.5)       |
 | `fetch_log`           | regular    | Audit log for every yfinance fetch                 |
-| `backtest_results`    | regular    | WFA results — one row per config per window        |
+| `backtest_results`    | regular    | ROOS results — one row per config per window        |
 
 **Indicators computed:** `rsi_14`, `ma_50`, `ma_200`, `ema_20`, `bb_upper/mid/lower`, `atr_14`, `adx_14`, `volume_sma`, `macd_line`, `macd_signal`, `macd_hist`, `roc_20`
 
@@ -287,15 +307,19 @@ All strategies are regime-filtered (TRENDING / CHOPPY / CRISIS) and volume-confi
 
 ## Phase Status
 
-| Phase | Description           | Status      |
-|-------|-----------------------|-------------|
-| 1     | Data pipeline         | ✅ Complete |
-| 2     | Strategy engine       | ✅ Complete |
-| 3     | Paper trade simulator | ✅ Complete |
-| 4     | Backtesting engine    | ⬜ Pending  |
-| 5     | Risk analytics        | ⬜ Pending  |
-| 6     | AI / sentiment layer   | ⬜ Pending  |
-| 7     | Dashboard + notifier   | ⬜ Pending  |
+| Phase | Description                         | Status           |
+|-------|-------------------------------------|------------------|
+| 1     | Data pipeline                       | ✅ Complete      |
+| 2     | Strategy engine                     | ✅ Complete      |
+| 3     | Paper trade simulator               | ✅ Complete      |
+| 4     | ROOS backtesting engine              | ✅ Complete      |
+| 4.5   | VIX vol regime filter               | ✅ Complete      |
+| 4.6   | VROC spike trigger                  | ✅ Complete      |
+| 4.7   | Drawdown circuit breakers           | ✅ Complete      |
+| 4.8   | Soft CB + crisis limits + floor     | ✅ Complete      |
+| 5     | Risk analytics (live side)          | ⬜ Pending       |
+| 6     | AI / sentiment layer                | ⬜ Pending       |
+| 7     | Dashboard + notifier                | 🔧 In progress   |
 
 ---
 

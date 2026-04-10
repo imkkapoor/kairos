@@ -1,5 +1,5 @@
 """
-backtesting/data_loader.py — DB data loading and WFA window generation.
+backtesting/data_loader.py — DB data loading and ROOS window generation.
 
 Rules:
   - No yfinance calls — all data from DB via db/connection.py engine.
@@ -225,13 +225,13 @@ def load_vix(start_date: date, end_date: date) -> pd.Series:
 
 # ---------------------------------------------------------------------------
 
-def generate_wfa_windows(
+def generate_roos_windows(
     start: date,
     end: date,
     train_years: int = 2,
     test_months: int = 6,
 ) -> list[dict]:
-    """Generate all non-overlapping out-of-sample WFA windows.
+    """Generate all non-overlapping out-of-sample ROOS windows.
 
     Each window dict:
         train_start, train_end, test_start, test_end (all date objects)

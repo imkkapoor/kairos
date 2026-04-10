@@ -132,7 +132,7 @@ def get_vix_regime(
     """Look up VIX regime for a specific date from a pre-loaded Series.
 
     Designed to be called once per trading day in the backtester using a
-    Series loaded once per WFA window — not once per day.
+    Series loaded once per ROOS window — not once per day.
 
     Applies a VROC spike override after the base classify_vix() result:
     if is_vix_spike() fires and the absolute regime is NORMAL or ELEVATED,

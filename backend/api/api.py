@@ -222,7 +222,7 @@ def get_trades():
 
 @app.get("/api/backtest")
 def get_backtest(config: str | None = None, run_id: str | None = None):
-    """WFA backtest results. Optional ?config=name and/or ?run_id=UUID to filter."""
+    """ROOS backtest results. Optional ?config=name and/or ?run_id=UUID to filter."""
     try:
         df = get_backtest_results(config_name=config, run_id=run_id)
         if df.empty:

@@ -79,6 +79,25 @@ export interface BacktestRun {
   use_vol_filter: boolean | null;
   avg_vix: number | null;
   pct_days_elevated: number | null;
+  // Phase 4.7/4.8: circuit breaker, soft CB, crisis limits
+  use_circuit_breaker: boolean | null;
+  use_soft_cb: boolean | null;
+  use_crisis_pos_limits: boolean | null;
+  // Phase 4.6 VROC
+  vroc_window: number | null;
+  vroc_threshold: number | null;
+  pct_days_spike: number | null;
+  // Phase 4.7/4.8 CB detail
+  pct_days_breaker_active: number | null;
+  avg_cb_mult: number | null;
+  pct_days_chatter_held: number | null;
+  // ROOS category
+  category: string | null;
+  // Capital mode: capital_refresh or capital_compounded
+  capital_mode: string | null;
+  // Config origin and raw config
+  config_origin: string | null;
+  config: Record<string, unknown> | null;
 }
 
 export interface BacktestRunInfo {
@@ -92,8 +111,16 @@ export interface BacktestRunInfo {
   avg_max_dd: number | null;
   avg_win_rate: number | null;
   total_pnl_usd: number | null;
-  avg_pnl_pct: number | null;   // avg per-window return (pnl / initial capital)
+  total_return_pct: number | null;  // total PnL / total invested capital across all windows
   currency: string;
+  any_vol_filter: boolean;
+  any_circuit_breaker: boolean;
+  any_soft_cb: boolean;
+  any_crisis_pos_limits: boolean;
+  category: string | null;
+  capital_mode: string | null;
+  config_origin: string | null;
+  avg_pnl_pct: number | null;  // avg per-window return (pnl / initial capital)
 }
 
 export interface BacktestRunListResponse {
@@ -109,6 +136,7 @@ export interface BacktestSummary {
   avg_win_rate: number | null;
   windows_tested: number;
   total_pnl: number | null;
+  avg_pnl_pct: number | null;  // avg per-window return (pnl / initial capital)
 }
 
 export interface BacktestResponse {

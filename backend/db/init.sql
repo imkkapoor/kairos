@@ -146,7 +146,7 @@ CREATE TABLE IF NOT EXISTS fetch_log (
 );
 
 -- ---------------------------------------------------------------------------
--- backtest_results: walk-forward analysis window results (Phase 4)
+-- backtest_results: rolling out-of-sample (ROOS) window results (Phase 4)
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS backtest_results (
     id              SERIAL PRIMARY KEY,
@@ -170,24 +170,36 @@ CREATE TABLE IF NOT EXISTS backtest_results (
     total_pnl_usd   DOUBLE PRECISION,
     annualized_vol  DOUBLE PRECISION,
     currency        TEXT             NOT NULL DEFAULT 'USD',
-    notes           TEXT
+    notes           TEXT,
+    -- Vol filter (Phase 4.5)
+    use_vol_filter      BOOLEAN          DEFAULT FALSE,
+    avg_vix             DOUBLE PRECISION,
+    pct_days_elevated   DOUBLE PRECISION,
+    -- VROC spike (Phase 4.6)
+    vroc_window         INTEGER          DEFAULT 10,
+    vroc_threshold      DOUBLE PRECISION DEFAULT 0.20,
+    pct_days_spike      DOUBLE PRECISION,
+    -- Circuit breaker (Phase 4.7)
+    use_circuit_breaker     BOOLEAN          DEFAULT FALSE,
+    dd_trigger              DOUBLE PRECISION DEFAULT 0.15,
+    dd_reset                DOUBLE PRECISION DEFAULT 0.10,
+    pct_days_breaker_active DOUBLE PRECISION,
+    -- Soft circuit breaker (Phase 4.8)
+    use_soft_cb             BOOLEAN          DEFAULT FALSE,
+    cb_soft_start           DOUBLE PRECISION,
+    cb_hard_stop            DOUBLE PRECISION,
+    cb_min_mult             DOUBLE PRECISION,
+    avg_cb_mult             DOUBLE PRECISION,
+    pct_days_chatter_held   DOUBLE PRECISION,
+    use_crisis_pos_limits   BOOLEAN          DEFAULT FALSE,
+    crisis_max_positions    INTEGER,
+    min_dollar_risk         DOUBLE PRECISION,
+    pct_signals_below_floor DOUBLE PRECISION,
+    -- ROOS metadata
+    category        TEXT             DEFAULT 'roos',          -- always 'roos' (Rolling Out-of-Sample)
+    capital_mode    TEXT             DEFAULT 'capital_refresh', -- capital_refresh | capital_compounded
+    config_origin   TEXT             DEFAULT 'manual'          -- manual (hand-crafted) | predicted (ML-optimised)
 );
-
--- Phase 4.5: vol filter columns (idempotent — safe to run on existing DBs)
-ALTER TABLE backtest_results ADD COLUMN IF NOT EXISTS use_vol_filter   BOOLEAN          DEFAULT FALSE;
-ALTER TABLE backtest_results ADD COLUMN IF NOT EXISTS avg_vix          DOUBLE PRECISION;
-ALTER TABLE backtest_results ADD COLUMN IF NOT EXISTS pct_days_elevated DOUBLE PRECISION;
-
--- Phase 4.6: VROC spike columns (idempotent — safe to run on existing DBs)
-ALTER TABLE backtest_results ADD COLUMN IF NOT EXISTS vroc_window      INTEGER          DEFAULT 10;
-ALTER TABLE backtest_results ADD COLUMN IF NOT EXISTS vroc_threshold   DOUBLE PRECISION DEFAULT 0.20;
-ALTER TABLE backtest_results ADD COLUMN IF NOT EXISTS pct_days_spike   DOUBLE PRECISION;
-
--- Phase 4.7: circuit breaker columns (idempotent — safe to run on existing DBs)
-ALTER TABLE backtest_results ADD COLUMN IF NOT EXISTS use_circuit_breaker      BOOLEAN          DEFAULT FALSE;
-ALTER TABLE backtest_results ADD COLUMN IF NOT EXISTS dd_trigger               DOUBLE PRECISION DEFAULT 0.15;
-ALTER TABLE backtest_results ADD COLUMN IF NOT EXISTS dd_reset                 DOUBLE PRECISION DEFAULT 0.10;
-ALTER TABLE backtest_results ADD COLUMN IF NOT EXISTS pct_days_breaker_active  DOUBLE PRECISION;
 
 -- ---------------------------------------------------------------------------
 -- vix_data: daily VIX close prices for volatility regime filtering (Phase 4.5)

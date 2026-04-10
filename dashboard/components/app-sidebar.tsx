@@ -14,11 +14,9 @@ import {
   SidebarGroup,
   SidebarGroupContent,
   SidebarGroupLabel,
-  SidebarHeader,
   SidebarMenu,
   SidebarMenuButton,
   SidebarMenuItem,
-  SidebarTrigger,
 } from "@/components/ui/sidebar";
 
 const NAV = [
@@ -32,14 +30,7 @@ export function AppSidebar() {
 
   return (
     <Sidebar collapsible="icon">
-      <SidebarHeader className="flex flex-row items-center justify-between px-3 py-3">
-        <span className="font-heading text-sm font-semibold tracking-tight group-data-[collapsible=icon]:hidden">
-          Kairos
-        </span>
-
-      </SidebarHeader>
-
-      <SidebarContent>
+      <SidebarContent className="pt-7.5">
         <SidebarGroup>
           <SidebarGroupLabel>Navigation</SidebarGroupLabel>
           <SidebarGroupContent>

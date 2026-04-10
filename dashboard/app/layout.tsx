@@ -32,7 +32,7 @@ export default function RootLayout({
     >
       <body className="min-h-full flex flex-col">
         <Providers>
-          <SidebarProvider>
+          <SidebarProvider open={false} defaultOpen={false}>
             <AppSidebar />
             <SidebarInset className="flex flex-col flex-1 min-w-0">
               <main className="flex-1 px-6 py-8">

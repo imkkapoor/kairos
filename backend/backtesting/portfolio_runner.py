@@ -272,8 +272,9 @@ def run_window(
     fx_rates: "pd.Series | None",
     sector_map: dict[str, str],
     vix_series: "pd.Series | None" = None,
+    initial_capital: float | None = None,
 ) -> dict:
-    """Simulate one WFA test window and return a metrics dict.
+    """Simulate one ROOS test window and return a metrics dict.
 
     Parameters
     ----------
@@ -295,8 +296,12 @@ def run_window(
     vix_series:
         pd.Series indexed by UTC Timestamps → VIX close.  Required when
         use_vol_filter=True; ignored when False.  Pass None to disable.
+    initial_capital:
+        Starting capital for this window. Defaults to INITIAL_CAPITAL when None.
+        Used by capital_compounded mode to carry forward capital.
     """
-    portfolio = BacktestPortfolio()
+    _capital = initial_capital if initial_capital is not None else INITIAL_CAPITAL
+    portfolio = BacktestPortfolio(initial_capital=_capital)
     trade_log: list[dict] = []   # {ticker, pnl_usd, pct, exit_type, cost_usd}
     equity_curve: list[tuple[date, float]] = []
 
@@ -312,14 +317,42 @@ def run_window(
     elevated_day_count: int = 0
     spike_day_count: int = 0
 
-    # Phase 4.7: circuit breaker state
+    # Phase 4.7: legacy binary circuit breaker state (backward compat)
     use_circuit_breaker = config.get("use_circuit_breaker", False)
     dd_trigger = config.get("dd_trigger", 0.15)
     dd_reset   = config.get("dd_reset",   0.10)
-    cb_peak_value = INITIAL_CAPITAL
+    cb_peak_value = _capital
     circuit_breaker_active = False
     breaker_active_day_count: int = 0
     circuit_breaker_days: list[bool] = []
+
+    # Phase 4.8: soft circuit breaker — linear de-leveraging (Change 1 + 2)
+    # use_soft_cb wins if both flags are set
+    use_soft_cb    = config.get("use_soft_cb", False)
+    cb_soft_start  = config.get("cb_soft_start", 0.05)
+    cb_hard_stop   = config.get("cb_hard_stop",  0.12)
+    cb_min_mult    = config.get("cb_min_mult",   0.25)
+    if use_soft_cb:
+        use_circuit_breaker = False
+    soft_cb_peak_value:  float = _capital
+    soft_cb_was_active:  bool  = False
+    soft_peak_dd:        float = 0.0
+    days_since_peak_dd:  int   = 0
+    last_cb_mult:        float = 1.0
+    cb_mult_values:      list  = []
+    chatter_held_days:   int   = 0
+
+    # Phase 4.8: crisis position limits — restrict new BUYs in HIGH/EXTREME (Change 3)
+    use_crisis_pos_limits = config.get("use_crisis_pos_limits", False)
+    crisis_max_positions  = config.get("crisis_max_positions",  8)
+
+    # Phase 4.8: minimum dollar risk floor (Change 4)
+    min_dollar_risk_cfg  = config.get("min_dollar_risk", 0)
+    signals_below_floor: int = 0
+    total_buy_attempts:  int = 0
+
+    # Phase 4.8: daily effective_mult tracking for allocation chart
+    effective_mult_by_day: list = []
 
     # Build sorted list of trading days within test window using SPY as calendar
     ref_ticker = "SPY" if "SPY" in ohlcv else next(iter(ohlcv), None)
@@ -337,6 +370,13 @@ def run_window(
         return _empty_metrics(test_start, test_end)
 
     all_tickers = list(ohlcv.keys())
+
+    # Rolling indicator cache: replicates live scanner timing.
+    # The live scanner runs at 17:15 ET on day T using T's close data,
+    # and trades execute at T+1's Open.  So for a trade on day_ts, the
+    # correct indicator snapshot is from the PREVIOUS trading day.
+    _scan_ind: dict[str, dict] = {}        # T-1 close indicators (used for signals)
+    _scan_prev_ind: dict[str, dict] = {}   # T-2 close indicators (used for crossovers)
 
     for day_ts in trading_days:
         day_date = day_ts.date()
@@ -359,21 +399,31 @@ def run_window(
         today_ind = _build_day_indicators(day_ts, indicators, ohlcv)
         prev_ind  = _build_prev_indicators(day_ts, indicators, ohlcv)
 
+        # scan_ind / scan_prev_ind: the indicator snapshots available at the
+        # Open of day_ts.  The live scanner runs at 17:15 the day BEFORE and
+        # uses that day's close data, so we replicate the same 1-day lag here.
+        # On the very first window-day there is no cached snapshot yet; fall
+        # back to prev_ind (the day before day_ts) which is the closest proxy.
+        scan_ind      = _scan_ind      if _scan_ind      else prev_ind
+        scan_prev_ind = _scan_prev_ind if _scan_prev_ind else prev_ind
+
         # ── 4. SPY crisis check (last 10 bars before today) ──────────────
+        # Use bars strictly before today to match scan_ind timing (T-1 close).
+        # The live scanner runs at 17:15 on T-1, so it sees T-1's close data.
         spy_ohlcv = ohlcv.get("SPY")
         spy_crisis_df = None
         if spy_ohlcv is not None:
-            spy_hist = spy_ohlcv[spy_ohlcv.index <= day_ts].tail(10)
+            spy_hist = spy_ohlcv[spy_ohlcv.index < day_ts].tail(10)
             if not spy_hist.empty:
                 spy_crisis_df = spy_hist[["Close"]].rename(columns={"Close": "close"})
 
         # ── 5. Regime detection ───────────────────────────────────────────
-        regimes = detect_all(today_ind, spy_crisis_df)
+        regimes = detect_all(scan_ind, spy_crisis_df)
 
         # ── 6. ROC rankings for reversal strategy ─────────────────────────
         all_roc = {
             t: float(row["roc_20"])
-            for t, row in today_ind.items()
+            for t, row in scan_ind.items()
             if row.get("roc_20") is not None
         }
         sorted_by_roc = sorted(all_roc, key=lambda t: all_roc[t])
@@ -385,15 +435,15 @@ def run_window(
         # ── 7. Sector scores for sector rotation ─────────────────────────
         _etfs = ["XLE", "XLK", "TLT", "XLU", "XLV", "SPY"]
         if all(
-            e in today_ind and today_ind[e].get("roc_20") is not None
+            e in scan_ind and scan_ind[e].get("roc_20") is not None
             for e in _etfs
         ):
-            xle = float(today_ind["XLE"]["roc_20"])
-            xlk = float(today_ind["XLK"]["roc_20"])
-            tlt = float(today_ind["TLT"]["roc_20"])
-            xlu = float(today_ind["XLU"]["roc_20"])
-            xlv = float(today_ind["XLV"]["roc_20"])
-            spy = float(today_ind["SPY"]["roc_20"])
+            xle = float(scan_ind["XLE"]["roc_20"])
+            xlk = float(scan_ind["XLK"]["roc_20"])
+            tlt = float(scan_ind["TLT"]["roc_20"])
+            xlu = float(scan_ind["XLU"]["roc_20"])
+            xlv = float(scan_ind["XLV"]["roc_20"])
+            spy = float(scan_ind["SPY"]["roc_20"])
             sector_scores: dict | None = {
                 "late_cycle": (xle - xlk) + (-tlt * 0.5),
                 "defensive":  ((xlu - spy) + (xlv - spy)) / 2,
@@ -443,6 +493,7 @@ def run_window(
             )
             size_mult = vol_state["size_mult"]
             suppressed_strategies = vol_state["suppressed"]
+            vix_regime_today = vol_state["regime"]
             if vol_state["vix"] is not None:
                 vix_day_values.append(vol_state["vix"])
             if vol_state["regime"] in ("HIGH", "EXTREME"):
@@ -452,19 +503,81 @@ def run_window(
         else:
             size_mult = 1.0
             suppressed_strategies: set[str] = set()
+            vix_regime_today = "NORMAL"
+            # If soft CB is active but vol filter is off, still get VIX regime for hold period
+            if use_soft_cb and vix_series is not None and not vix_series.empty:
+                _scb_state = get_vix_regime(
+                    day_date, vix_series,
+                    sma_window=vroc_window,
+                    vroc_threshold=vroc_threshold,
+                )
+                vix_regime_today = _scb_state.get("regime", "NORMAL")
+
+        # ── 9b. Soft CB state update (Change 1 + 2) ────────────────────────
+        if use_soft_cb:
+            _scb_val   = portfolio.get_total_value(open_prices, fx_today)
+            _current_dd = (soft_cb_peak_value - _scb_val) / soft_cb_peak_value if soft_cb_peak_value > 0 else 0.0
+            soft_cb_peak_value = max(soft_cb_peak_value, _scb_val)
+
+            # days_since_peak_dd: reset whenever a new drawdown low is reached
+            if _current_dd > soft_peak_dd:
+                soft_peak_dd       = _current_dd
+                days_since_peak_dd = 0
+            else:
+                days_since_peak_dd += 1
+
+            # VIX-linked minimum recovery hold (Change 2)
+            _rec_days_map = {"NORMAL": 3, "ELEVATED": 5, "HIGH": 8, "EXTREME": 12}
+            _vix_rec_days = _rec_days_map.get(vix_regime_today, 3)
+
+            if _current_dd < cb_soft_start:
+                if soft_cb_was_active and days_since_peak_dd < _vix_rec_days:
+                    # Chatter prevention: hold at last linear value, don't release yet
+                    cb_mult = last_cb_mult
+                    chatter_held_days += 1
+                else:
+                    cb_mult = 1.0
+                    soft_cb_was_active = False
+            elif _current_dd < cb_hard_stop:
+                _band   = cb_hard_stop - cb_soft_start
+                cb_mult = 1.0 - ((1.0 - cb_min_mult) * (_current_dd - cb_soft_start) / _band)
+                soft_cb_was_active = True
+            else:
+                cb_mult = 0.0
+                soft_cb_was_active = True
+
+            last_cb_mult = cb_mult
+        elif use_circuit_breaker:
+            # Legacy binary CB: cb_mult is 0 when breaker active, 1 otherwise
+            cb_mult = 0.0 if circuit_breaker_active else 1.0
+        else:
+            cb_mult = 1.0
+
+        cb_mult_values.append(cb_mult)
+
+        # ── 9c. Effective max positions (crisis limits, Change 3) ──────────
+        if use_crisis_pos_limits and vix_regime_today in ("HIGH", "EXTREME"):
+            effective_max_positions = crisis_max_positions
+        else:
+            effective_max_positions = max_open_positions
+
+        # Day-level effective multiplier for allocation chart
+        effective_mult_by_day.append((day_date, size_mult * cb_mult))
 
         # ── 10. Generate signals from all strategies ──────────────────────
+        # Use scan_ind (T-1 close) so signal generation matches the live
+        # scanner which runs after close and fills at next-day Open.
         all_signals: list[dict] = []
         all_signals.extend(rsi_strategy.generate_signals(
-            all_tickers, today_ind, regimes, open_tickers))
+            all_tickers, scan_ind, regimes, open_tickers))
         all_signals.extend(momentum_strategy.generate_signals(
-            all_tickers, today_ind, prev_ind, regimes, open_tickers))
+            all_tickers, scan_ind, scan_prev_ind, regimes, open_tickers))
         all_signals.extend(macd_strategy.generate_signals(
-            all_tickers, today_ind, prev_ind, regimes, open_tickers))
+            all_tickers, scan_ind, scan_prev_ind, regimes, open_tickers))
         all_signals.extend(reversal_strategy.generate_signals(
-            all_tickers, today_ind, regimes, open_tickers, roc_rankings))
+            all_tickers, scan_ind, regimes, open_tickers, roc_rankings))
         all_signals.extend(sector_rotation_strategy.generate_signals(
-            all_tickers, today_ind, regimes, open_tickers, sector_scores, sector_map))
+            all_tickers, scan_ind, regimes, open_tickers, sector_scores, sector_map))
 
         # Keep only BUY signals (SELL exits handled by stop/TP above)
         buy_signals = [s for s in all_signals if str(s.get("signal_type", "")).upper() == "BUY"]
@@ -517,7 +630,7 @@ def run_window(
             if fill_price is None or fill_price <= 0:
                 continue
 
-            atr = today_ind.get(tkr, {}).get("atr_14")
+            atr = scan_ind.get(tkr, {}).get("atr_14")
             if atr is None:
                 continue
             try:
@@ -537,8 +650,15 @@ def run_window(
             is_cad = tkr.endswith(".TO")
             risk_per_usd = risk_per_native * fx_today if is_cad else risk_per_native
 
-            total_val  = portfolio.get_total_value(close_prices, fx_today)
-            dollar_risk = strength * portfolio.max_portfolio_risk * total_val * size_mult
+            total_val      = portfolio.get_total_value(close_prices, fx_today)
+            effective_mult  = size_mult * cb_mult
+            if effective_mult == 0.0:
+                continue  # hard stop: no new BUYs (soft CB or binary CB)
+            dollar_risk = strength * portfolio.max_portfolio_risk * total_val * effective_mult
+            total_buy_attempts += 1
+            if dollar_risk < min_dollar_risk_cfg:
+                signals_below_floor += 1
+                continue
             qty = floor(dollar_risk / risk_per_usd)
             if qty < 1:
                 continue
@@ -573,7 +693,7 @@ def run_window(
             sector = sector_map.get(tkr, "Unknown")
             allowed, _ = portfolio.can_open(
                 tkr, cost_usd, sector, close_prices, fx_today,
-                max_open_positions, max_sector_exposure,
+                effective_max_positions, max_sector_exposure,
             )
             if not allowed:
                 continue
@@ -589,6 +709,13 @@ def run_window(
         if total_val > portfolio.peak_value:
             portfolio.peak_value = total_val
         equity_curve.append((day_date, total_val))
+
+        # ── 16. Advance rolling indicator cache for next iteration ────────
+        # _scan_ind becomes the indicators from today's close; on the next
+        # trading day these will be the "prior-day" signals the live scanner
+        # would have generated overnight.
+        _scan_prev_ind = _scan_ind
+        _scan_ind      = today_ind
 
     # ── Force-close any remaining positions at last Close ─────────────────
     if equity_curve:
@@ -631,6 +758,23 @@ def run_window(
     )
     metrics["circuit_breaker_days"]    = circuit_breaker_days  # per-day list, not persisted to DB
 
+    # Phase 4.8: soft CB + additional risk control metrics
+    metrics["use_soft_cb"]            = use_soft_cb
+    metrics["cb_soft_start"]          = cb_soft_start if use_soft_cb else None
+    metrics["cb_hard_stop"]           = cb_hard_stop  if use_soft_cb else None
+    metrics["cb_min_mult"]            = cb_min_mult   if use_soft_cb else None
+    metrics["avg_cb_mult"]            = float(np.mean(cb_mult_values)) if cb_mult_values else None
+    metrics["pct_days_chatter_held"]  = (
+        chatter_held_days / n_days if (use_soft_cb and n_days > 0) else None
+    )
+    metrics["use_crisis_pos_limits"]  = use_crisis_pos_limits
+    metrics["crisis_max_positions"]   = crisis_max_positions if use_crisis_pos_limits else None
+    metrics["min_dollar_risk"]        = min_dollar_risk_cfg
+    metrics["pct_signals_below_floor"] = (
+        signals_below_floor / total_buy_attempts if total_buy_attempts > 0 else None
+    )
+    metrics["effective_mult_by_day"]  = effective_mult_by_day  # per-day, not persisted to DB
+
     return metrics
 
 
@@ -668,6 +812,18 @@ def _empty_metrics(test_start: date, test_end: date) -> dict:
         "dd_reset":                None,
         "pct_days_breaker_active": None,
         "circuit_breaker_days":    [],
+        # Phase 4.8 soft CB + additional controls
+        "use_soft_cb":             False,
+        "cb_soft_start":           None,
+        "cb_hard_stop":            None,
+        "cb_min_mult":             None,
+        "avg_cb_mult":             None,
+        "pct_days_chatter_held":   None,
+        "use_crisis_pos_limits":   False,
+        "crisis_max_positions":    None,
+        "min_dollar_risk":         0,
+        "pct_signals_below_floor": None,
+        "effective_mult_by_day":   [],
     }
 
 
@@ -752,21 +908,34 @@ def _compute_metrics(
 
 
 # ---------------------------------------------------------------------------
-# WFA orchestrator
+# ROOS orchestrator
 # ---------------------------------------------------------------------------
 
-def run_wfa(
+def run_roos(
     config: dict,
     config_name: str,
     windows: list[dict],
     tickers: list[str],
     sector_map: dict[str, str],
     progress_prefix: str = "",
+    capital_mode: str = "capital_refresh",
+    preloaded_data: dict | None = None,
 ) -> list[dict]:
-    """Run all WFA windows for one allocation config.
+    """Run all ROOS windows for one allocation config.
 
     Data for the full date range is loaded once (not per window) so overlapping
     windows share the same in-memory DataFrames. Each window gets a slice.
+
+    Parameters
+    ----------
+    capital_mode:
+        'capital_refresh'    — fresh INITIAL_CAPITAL per window (default).
+        'capital_compounded' — single continuous simulation across the full
+                               date range (first test_start → last test_end).
+    preloaded_data:
+        Optional dict with pre-loaded DataFrames to skip DB queries.
+        Keys: 'ohlcv', 'indicators', 'fx_rates', 'vix' (vix may be None).
+        When provided, data loading is skipped entirely.
 
     Returns list of per-window result dicts.
     """
@@ -789,22 +958,75 @@ def run_wfa(
     except ImportError:
         _rich = False
 
-    if _rich:
-        out = Console()
-        out.print(f"  [cyan]Loading data ({all_start} → {all_end})…[/cyan]")
-
-    ohlcv_all      = load_ohlcv(tickers, all_start, all_end)
-    indicators_all = load_indicators(tickers, all_start, all_end)
-    fx_rates_all   = load_fx_rates(all_start, all_end)
-
-    # Phase 4.5: load VIX once for the full range if this config uses vol filter
-    use_vol = config.get("use_vol_filter", False)
-    if use_vol:
-        from backtesting.data_loader import load_vix
-        vix_all = load_vix(all_start, all_end)
+    if preloaded_data is not None:
+        ohlcv_all      = preloaded_data["ohlcv"]
+        indicators_all = preloaded_data["indicators"]
+        fx_rates_all   = preloaded_data["fx_rates"]
+        vix_all        = preloaded_data.get("vix")
     else:
-        vix_all = None
+        if _rich:
+            out = Console()
+            out.print(f"  [cyan]Loading data ({all_start} → {all_end})…[/cyan]")
 
+        ohlcv_all      = load_ohlcv(tickers, all_start, all_end)
+        indicators_all = load_indicators(tickers, all_start, all_end)
+        fx_rates_all   = load_fx_rates(all_start, all_end)
+
+        # Phase 4.5: load VIX once for the full range if this config uses vol filter
+        use_vol = config.get("use_vol_filter", False)
+        if use_vol:
+            from backtesting.data_loader import load_vix
+            vix_all = load_vix(all_start, all_end)
+        else:
+            vix_all = None
+
+    # ------------------------------------------------------------------
+    # capital_compounded: single continuous run across the full date range
+    # ------------------------------------------------------------------
+    if capital_mode == "capital_compounded":
+        test_start = windows[0]["test_start"]
+        test_end   = windows[-1]["test_end"]
+
+        if _rich:
+            out = Console()
+            out.print(f"  {progress_prefix}[bold]{config_name}[/bold]  {test_start} → {test_end} (compounded)")
+
+        buf_start = pd.Timestamp(test_start, tz="UTC") - pd.Timedelta(days=20)
+
+        ohlcv_win = {
+            t: df[df.index >= buf_start]
+            for t, df in ohlcv_all.items()
+            if not df.empty
+        }
+        ind_win = {
+            t: df[df.index >= buf_start]
+            for t, df in indicators_all.items()
+            if not df.empty
+        }
+        fx_win = (
+            fx_rates_all[fx_rates_all.index >= buf_start]
+            if fx_rates_all is not None else None
+        )
+        vix_win = (
+            vix_all[vix_all.index >= buf_start]
+            if vix_all is not None and not vix_all.empty else None
+        )
+
+        metrics = run_window(
+            test_start, test_end, config,
+            ohlcv_win, ind_win, fx_win, sector_map,
+            vix_series=vix_win,
+        )
+        metrics["config_name"]   = config_name
+        metrics["config"]        = config
+        metrics["window_index"]  = 1
+        metrics["category"]      = "roos"
+        metrics["capital_mode"]  = capital_mode
+        return [metrics]
+
+    # ------------------------------------------------------------------
+    # capital_refresh: independent window per ROOS period (original)
+    # ------------------------------------------------------------------
     results: list[dict] = []
     n_windows = len(windows)
 
@@ -833,7 +1055,7 @@ def run_wfa(
                 description=f"{config_name}  {test_start} → {test_end}",
             )
 
-        # Slice to test window (keep a 10-day buffer before test_start for prev_indicators)
+        # Slice to test window (keep a 20-day buffer before test_start for prev_indicators)
         buf_start = pd.Timestamp(test_start, tz="UTC") - pd.Timedelta(days=20)
 
         ohlcv_win = {
@@ -863,6 +1085,8 @@ def run_wfa(
         metrics["config_name"]  = config_name
         metrics["config"]       = config
         metrics["window_index"] = win_idx
+        metrics["category"]     = "roos"
+        metrics["capital_mode"]  = capital_mode
         results.append(metrics)
 
         if _progress_ctx:
@@ -880,7 +1104,7 @@ def run_all_configs(
     tickers: list[str],
     sector_map: dict[str, str],
 ) -> "pd.DataFrame":
-    """Run all allocation configs across all WFA windows, store to DB.
+    """Run all allocation configs across all ROOS windows, store to DB.
 
     Returns a summary DataFrame.
     """
@@ -901,7 +1125,7 @@ def run_all_configs(
         if _con:
             _con.rule(f"[bold green]Config {idx}/{n_configs}: {config_name}[/bold green]")
 
-        window_results = run_wfa(
+        window_results = run_roos(
             config, config_name, windows, tickers, sector_map,
             progress_prefix=f"[{idx}/{n_configs}] ",
         )

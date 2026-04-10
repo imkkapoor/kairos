@@ -1,5 +1,5 @@
 """
-backtesting/charts.py — Matplotlib chart generators for WFA backtest results.
+backtesting/charts.py — Matplotlib chart generators for ROOS backtest results.
 
 All charts are saved as PNG files to backend/backtesting/output/.
 The output/ directory is gitignored.
@@ -20,11 +20,11 @@ def _ensure_output_dir() -> Path:
 
 
 # ---------------------------------------------------------------------------
-# WFA equity curves — one colored line per test window
+# ROOS equity curves — one colored line per test window
 # ---------------------------------------------------------------------------
 
-def plot_wfa_equity_curves(results: list[dict], config_name: str) -> Path:
-    """Plot one equity curve per WFA test window on a single chart.
+def plot_roos_equity_curves(results: list[dict], config_name: str) -> Path:
+    """Plot one equity curve per ROOS test window on a single chart.
 
     X-axis: day offset within window (0 = first test day).
     Y-axis: portfolio value in USD.
@@ -62,13 +62,13 @@ def plot_wfa_equity_curves(results: list[dict], config_name: str) -> Path:
         y=_first_capital(results), color="grey", linestyle="--",
         linewidth=0.8, label="Initial capital",
     )
-    ax.set_title(f"{config_name} — WFA equity curves ({n_wins} windows)")
+    ax.set_title(f"{config_name} — ROOS equity curves ({n_wins} windows)")
     ax.set_xlabel("Trading days within window")
     ax.set_ylabel("Portfolio value (USD)")
     ax.legend(fontsize=7, ncol=3, loc="best")
     fig.tight_layout()
 
-    out_path = out_dir / f"{config_name}_wfa_equity_curves.png"
+    out_path = out_dir / f"{config_name}_roos_equity_curves.png"
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
     return out_path
@@ -107,7 +107,7 @@ def plot_config_comparison(summary_df: pd.DataFrame) -> Path:
 
     ax.set_xticks(x)
     ax.set_xticklabels(configs, rotation=15, ha="right")
-    ax.set_title("Allocation config comparison — Avg Sharpe & Calmar across all WFA windows")
+    ax.set_title("Allocation config comparison — Avg Sharpe & Calmar across all ROOS windows")
     ax.set_ylabel("Ratio")
     ax.axhline(0, color="grey", linewidth=0.6)
     ax.legend()
@@ -128,7 +128,7 @@ def plot_config_comparison(summary_df: pd.DataFrame) -> Path:
 def plot_monthly_returns_heatmap(results: list[dict], config_name: str) -> Path:
     """Month × Year heatmap of portfolio returns.
 
-    Green = positive, Red = negative. Months are stitched across all WFA windows.
+    Green = positive, Red = negative. Months are stitched across all ROOS windows.
 
     Parameters
     ----------
@@ -201,11 +201,11 @@ def plot_monthly_returns_heatmap(results: list[dict], config_name: str) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# Drawdown per WFA window bar chart
+# Drawdown per ROOS window bar chart
 # ---------------------------------------------------------------------------
 
 def plot_drawdown_by_window(results: list[dict], config_name: str) -> Path:
-    """Bar chart: max drawdown per WFA window.
+    """Bar chart: max drawdown per ROOS window.
 
     Shows which market regimes were hardest on the strategy.
 
@@ -234,7 +234,7 @@ def plot_drawdown_by_window(results: list[dict], config_name: str) -> Path:
     ax.set_xticklabels([f"W{n}\n{s}" for n, s in zip(win_nums, starts)],
                        rotation=45, ha="right", fontsize=8)
     ax.set_ylabel("Max drawdown (%)")
-    ax.set_title(f"{config_name} — Max drawdown per WFA window")
+    ax.set_title(f"{config_name} — Max drawdown per ROOS window")
     ax.bar_label(bars, fmt="%.1f%%", padding=2, fontsize=8)
     fig.tight_layout()
 
@@ -264,7 +264,7 @@ def generate_all_charts(
     paths: list[Path] = []
 
     for config_name, results in all_results.items():
-        paths.append(plot_wfa_equity_curves(results, config_name))
+        paths.append(plot_roos_equity_curves(results, config_name))
         paths.append(plot_monthly_returns_heatmap(results, config_name))
         paths.append(plot_drawdown_by_window(results, config_name))
 
@@ -294,7 +294,7 @@ def generate_all_charts(
         warnings.warn(f"Circuit breaker comparison chart skipped: {exc}")
 
     # Phase 4.7: per-config equity curves with breaker overlay
-    CB_CONFIGS = {"vol_adaptive_full", "vol_adaptive_tight_cb"}
+    CB_CONFIGS = {"vol_hard_cb", "vol_hard_cb_tight"}
     for config_name, results in all_results.items():
         if config_name in CB_CONFIGS:
             try:
@@ -302,6 +302,22 @@ def generate_all_charts(
             except Exception as exc:
                 import warnings
                 warnings.warn(f"Equity breaker chart for {config_name} skipped: {exc}")
+
+    # Phase 4.8: soft CB comparison + effective allocation charts
+    try:
+        paths.append(plot_soft_cb_comparison())
+    except Exception as exc:
+        import warnings
+        warnings.warn(f"Soft CB comparison chart skipped: {exc}")
+
+    try:
+        paths.append(plot_effective_allocation(
+            config_name="vol_soft_cb_full",
+            all_results=all_results,
+        ))
+    except Exception as exc:
+        import warnings
+        warnings.warn(f"Effective allocation chart skipped: {exc}")
 
     return paths
 
@@ -312,9 +328,9 @@ def generate_all_charts(
 
 def plot_vol_filter_comparison(
     baseline: str = "live_default",
-    filtered: str = "vol_filtered_default",
+    filtered: str = "vol_baseline",
 ) -> Path:
-    """Side-by-side grouped bar chart comparing baseline vs vol-filtered per WFA window.
+    """Side-by-side grouped bar chart comparing baseline vs vol-filtered per ROOS window.
 
     Metrics shown: sharpe_ratio, calmar_ratio, max_drawdown, cagr.
     Windows 3 and 7 (historically worst) are highlighted with a red band.
@@ -363,7 +379,7 @@ def plot_vol_filter_comparison(
     width = 0.35
     fig, axes = plt.subplots(2, 2, figsize=(14, 8))
     fig.suptitle(
-        f"Vol Filter Comparison: {baseline} vs {filtered} — per WFA window",
+        f"Vol Filter Comparison: {baseline} vs {filtered} — per ROOS window",
         fontsize=13, fontweight="bold",
     )
 
@@ -398,7 +414,7 @@ def plot_vol_filter_comparison(
 
 def plot_drawdown_improvement(
     baseline: str = "live_default",
-    filtered: str = "vol_filtered_default",
+    filtered: str = "vol_baseline",
 ) -> Path:
     """Scatter plot: baseline max_drawdown (x) vs filtered max_drawdown (y) per window.
 
@@ -450,7 +466,7 @@ def plot_drawdown_improvement(
 
     ax.set_xlabel(f"Max Drawdown — {baseline} (%)", fontsize=11)
     ax.set_ylabel(f"Max Drawdown — {filtered} (%)", fontsize=11)
-    ax.set_title("Drawdown improvement per WFA window\n(points below y=x = vol filter helped)", fontsize=12)
+    ax.set_title("Drawdown improvement per ROOS window\n(points below y=x = vol filter helped)", fontsize=12)
     ax.legend(fontsize=9)
     fig.tight_layout()
 
@@ -460,7 +476,7 @@ def plot_drawdown_improvement(
     return out_path
 
 
-def plot_vix_regime_timeline(config_name: str = "vol_filtered_default") -> Path:
+def plot_vix_regime_timeline(config_name: str = "vol_baseline") -> Path:
     """Line chart of VIX close from 2017 to present with regime background bands.
 
     Background colours:
@@ -469,7 +485,7 @@ def plot_vix_regime_timeline(config_name: str = "vol_filtered_default") -> Path:
         VIX <  40: orange (HIGH)
         VIX >= 40: red    (EXTREME)
 
-    WFA window boundaries overlaid as vertical dashed lines.
+    ROOS window boundaries overlaid as vertical dashed lines.
     """
     import matplotlib.pyplot as plt
     import matplotlib.dates as mdates
@@ -511,7 +527,7 @@ def plot_vix_regime_timeline(config_name: str = "vol_filtered_default") -> Path:
     for y, col in [(20, "#f0ad4e"), (30, "#e67e22"), (40, "#c0392b")]:
         ax.axhline(y, color=col, linewidth=0.8, linestyle="--", alpha=0.6)
 
-    # WFA window boundaries
+    # ROOS window boundaries
     try:
         res_df = get_backtest_results(config_name=config_name)
         if not res_df.empty:
@@ -531,7 +547,7 @@ def plot_vix_regime_timeline(config_name: str = "vol_filtered_default") -> Path:
     ax.xaxis.set_major_locator(mdates.YearLocator())
     ax.set_xlabel("Date")
     ax.set_ylabel("VIX")
-    ax.set_title("VIX regime timeline (2017–present) with WFA window boundaries", fontsize=13)
+    ax.set_title("VIX regime timeline (2017–present) with ROOS window boundaries", fontsize=13)
     ax.legend(fontsize=8, loc="upper right", ncol=3)
     fig.tight_layout()
 
@@ -546,12 +562,12 @@ def plot_vix_regime_timeline(config_name: str = "vol_filtered_default") -> Path:
 # ---------------------------------------------------------------------------
 
 def plot_vroc_comparison(
-    baseline: str = "vol_filtered_regime_adaptive",
-    vroc: str = "vol_adaptive_vroc",
+    baseline: str = "vol_regime_adaptive",
+    vroc: str = "vol_vroc_adaptive",
 ) -> Path:
-    """Side-by-side bars comparing vol_filtered_regime_adaptive vs vol_adaptive_vroc.
+    """Side-by-side bars comparing vol_regime_adaptive vs vol_vroc_adaptive.
 
-    Top subplot: Sharpe / MaxDD / CAGR per WFA window, baseline vs VROC config.
+    Top subplot: Sharpe / MaxDD / CAGR per ROOS window, baseline vs VROC config.
     Red background band on W03 (2020-H1) and W07 (2022-H1) — target spike windows.
 
     Bottom subplot: pct_days_spike per window for the VROC config only, showing
@@ -573,7 +589,7 @@ def plot_vroc_comparison(
         ax.text(
             0.5, 0.5,
             f"No data for '{baseline}' or '{vroc}'.\n"
-            "Run: make backtest-config CONFIG=vol_adaptive_vroc",
+            "Run: make backtest-config CONFIG=vol_vroc_adaptive",
             ha="center", va="center", transform=ax.transAxes, fontsize=11,
         )
         ax.set_title("VROC comparison — no data yet")
@@ -614,7 +630,7 @@ def plot_vroc_comparison(
         gridspec_kw={"height_ratios": [3, 1.5]},
     )
     fig.suptitle(
-        f"VROC Spike Comparison: {baseline} vs {vroc} \u2014 per WFA window",
+        f"VROC Spike Comparison: {baseline} vs {vroc} \u2014 per ROOS window",
         fontsize=13, fontweight="bold",
     )
 
@@ -682,11 +698,11 @@ def plot_vroc_comparison(
 # ---------------------------------------------------------------------------
 
 def plot_circuit_breaker_comparison(
-    no_cb: str = "vol_adaptive_vroc",
-    cb_full: str = "vol_adaptive_full",
-    cb_tight: str = "vol_adaptive_tight_cb",
+    no_cb: str = "vol_vroc_adaptive",
+    cb_full: str = "vol_hard_cb",
+    cb_tight: str = "vol_hard_cb_tight",
 ) -> Path:
-    """Grouped bar chart comparing three configs across all WFA windows.
+    """Grouped bar chart comparing three configs across all ROOS windows.
 
     Top subplot: max_drawdown per window for all 3 configs.
     Bottom subplot: pct_days_breaker_active per window for the two CB configs.
@@ -750,7 +766,7 @@ def plot_circuit_breaker_comparison(
         gridspec_kw={"height_ratios": [2, 1]},
     )
     fig.suptitle(
-        "Circuit Breaker Comparison: No CB vs CB-15% vs CB-10% — per WFA window",
+        "Circuit Breaker Comparison: No CB vs CB-15% vs CB-10% — per ROOS window",
         fontsize=13, fontweight="bold",
     )
 
@@ -767,7 +783,7 @@ def plot_circuit_breaker_comparison(
     ax_top.set_xticks(x)
     ax_top.set_xticklabels([f"W{wi}" for wi in all_wins], fontsize=9)
     ax_top.set_ylabel("Max Drawdown (%)")
-    ax_top.set_title("Max Drawdown per WFA Window")
+    ax_top.set_title("Max Drawdown per ROOS Window")
     ax_top.axhline(0, color="grey", linewidth=0.6)
     ax_top.legend(fontsize=9)
     ax_top.bar_label(b1, fmt="%.1f%%", padding=2, fontsize=7)
@@ -799,9 +815,9 @@ def plot_circuit_breaker_comparison(
 
 def plot_equity_curves_with_breaker(
     results: list[dict],
-    config_name: str = "vol_adaptive_full",
+    config_name: str = "vol_hard_cb",
 ) -> Path:
-    """Overlay equity curves per WFA window with red shading where circuit breaker fired.
+    """Overlay equity curves per ROOS window with red shading where circuit breaker fired.
 
     One line per window. Red shaded regions indicate days where circuit_breaker_active=True.
     Saves: output/{config_name}_equity_breaker.png
@@ -862,6 +878,212 @@ def plot_equity_curves_with_breaker(
     fig.tight_layout()
 
     out_path = out_dir / f"{config_name}_equity_breaker.png"
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.8: Soft CB comparison chart
+# ---------------------------------------------------------------------------
+
+def plot_soft_cb_comparison(
+    no_cb:    str = "vol_vroc_adaptive",
+    soft_cb:  str = "vol_soft_cb",
+    full_v2:  str = "vol_soft_cb_full",
+) -> Path:
+    """Grouped bar: Sharpe per window for no-CB vs soft-CB vs full-v2.
+
+    Top subplot: Sharpe per ROOS window (three grouped bars).
+    Bottom subplot: avg_cb_mult per window for the two soft-CB configs.
+    Red band on W03, W07, W14.
+    Saves: output/soft_cb_comparison.png
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+    from db.connection import get_backtest_results
+
+    out_dir = _ensure_output_dir()
+
+    nocb_df  = get_backtest_results(config_name=no_cb)
+    scb_df   = get_backtest_results(config_name=soft_cb)
+    full_df  = get_backtest_results(config_name=full_v2)
+
+    if nocb_df.empty and scb_df.empty and full_df.empty:
+        fig, ax = plt.subplots(figsize=(10, 4))
+        ax.text(0.5, 0.5,
+                f"No data yet. Run: make backtest-config CONFIG={soft_cb}",
+                ha="center", va="center", transform=ax.transAxes, fontsize=11)
+        ax.set_title("Soft CB comparison — no data yet")
+        out_path = out_dir / "soft_cb_comparison.png"
+        fig.savefig(out_path, dpi=150)
+        plt.close(fig)
+        return out_path
+
+    all_wins = sorted(set(
+        list(nocb_df["window_index"].tolist() if not nocb_df.empty else []) +
+        list(scb_df["window_index"].tolist()  if not scb_df.empty  else []) +
+        list(full_df["window_index"].tolist() if not full_df.empty else [])
+    ))
+    n_wins = len(all_wins)
+    x = np.arange(n_wins)
+    width = 0.25
+    HIGHLIGHT = {3, 7, 14}
+
+    def _get_vals(df: pd.DataFrame, col: str) -> np.ndarray:
+        if df.empty:
+            return np.full(n_wins, np.nan)
+        idx_map = {wi: i for i, wi in enumerate(all_wins)}
+        arr = np.full(n_wins, np.nan)
+        for _, row in df.iterrows():
+            i = idx_map.get(int(row["window_index"]))
+            if i is not None and row.get(col) is not None:
+                arr[i] = float(row[col])
+        return arr
+
+    sharpe_nocb = _get_vals(nocb_df, "sharpe_ratio")
+    sharpe_scb  = _get_vals(scb_df,  "sharpe_ratio")
+    sharpe_full = _get_vals(full_df,  "sharpe_ratio")
+    mult_scb    = _get_vals(scb_df,  "avg_cb_mult")
+    mult_full   = _get_vals(full_df,  "avg_cb_mult")
+
+    fig, (ax_top, ax_bot) = plt.subplots(
+        2, 1, figsize=(16, 9),
+        gridspec_kw={"height_ratios": [2, 1]},
+    )
+    fig.suptitle(
+        "Soft CB Comparison: No CB vs Soft CB vs Full-v2 — per ROOS window",
+        fontsize=13, fontweight="bold",
+    )
+
+    for ax in (ax_top, ax_bot):
+        for i, wi in enumerate(all_wins):
+            if wi in HIGHLIGHT:
+                ax.axvspan(i - 0.5, i + 0.5, color="#FFCCCC", alpha=0.45, zorder=0)
+
+    # Top: Sharpe per window
+    b1 = ax_top.bar(x - width, np.nan_to_num(sharpe_nocb), width,
+                    label=f"{no_cb} (no CB)",   color="#4C72B0", alpha=0.85)
+    b2 = ax_top.bar(x,          np.nan_to_num(sharpe_scb),  width,
+                    label=f"{soft_cb} (soft CB)", color="#55A868", alpha=0.85)
+    b3 = ax_top.bar(x + width,  np.nan_to_num(sharpe_full), width,
+                    label=f"{full_v2} (full v2)", color="#C44E52", alpha=0.85)
+    ax_top.set_xticks(x)
+    ax_top.set_xticklabels([f"W{wi}" for wi in all_wins], fontsize=9)
+    ax_top.set_ylabel("Sharpe Ratio")
+    ax_top.set_title("Sharpe Ratio per ROOS Window")
+    ax_top.axhline(0, color="grey", linewidth=0.6)
+    ax_top.legend(fontsize=9)
+    ax_top.bar_label(b1, fmt="%.2f", padding=2, fontsize=7)
+    ax_top.bar_label(b2, fmt="%.2f", padding=2, fontsize=7)
+    ax_top.bar_label(b3, fmt="%.2f", padding=2, fontsize=7)
+
+    # Bottom: avg_cb_mult (soft CB configs only)
+    b4 = ax_bot.bar(x - width / 2, np.nan_to_num(mult_scb,  nan=1.0), width,
+                    label=f"{soft_cb} avg_cb_mult",  color="#55A868", alpha=0.85)
+    b5 = ax_bot.bar(x + width / 2, np.nan_to_num(mult_full, nan=1.0), width,
+                    label=f"{full_v2} avg_cb_mult", color="#C44E52", alpha=0.85)
+    ax_bot.set_xticks(x)
+    ax_bot.set_xticklabels([f"W{wi}" for wi in all_wins], fontsize=9)
+    ax_bot.set_ylabel("avg_cb_mult")
+    ax_bot.set_title(
+        "avg_cb_mult per Window (1.0 = never triggered; W01/W09/W10 should be > 0.90)"
+    )
+    ax_bot.set_ylim(0, 1.1)
+    ax_bot.axhline(0.90, color="red", linewidth=0.8, linestyle="--", alpha=0.6, label="0.90 threshold")
+    ax_bot.legend(fontsize=9)
+    ax_bot.bar_label(b4, fmt="%.2f", padding=2, fontsize=7)
+    ax_bot.bar_label(b5, fmt="%.2f", padding=2, fontsize=7)
+
+    red_patch = mpatches.Patch(color="#FFCCCC", alpha=0.7, label="Target windows (W03, W07, W14)")
+    fig.legend(handles=[red_patch], loc="lower center", fontsize=9, bbox_to_anchor=(0.5, 0.01))
+    fig.tight_layout(rect=[0, 0.04, 1, 1])
+
+    out_path = out_dir / "soft_cb_comparison.png"
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
+
+
+def plot_effective_allocation(
+    config_name: str = "vol_soft_cb_full",
+    all_results: "dict | None" = None,
+) -> Path:
+    """Line chart of daily effective_mult (vol_mult * cb_mult) over all ROOS windows.
+
+    Green shading where mult == 1.0 (full allocation).
+    Yellow shading where 0 < mult < 1.0 (partially suppressed).
+    Red shading where mult == 0.0 (hard stop active).
+
+    Parameters
+    ----------
+    config_name:
+        Name of config to plot (must be a soft-CB config).
+    all_results:
+        In-memory results dict {config_name: [window_dicts]} from run_roos.
+        If None or the config is missing, an empty placeholder is saved.
+
+    Saves: output/{config_name}_allocation.png
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates
+
+    out_dir = _ensure_output_dir()
+    out_path = out_dir / f"{config_name}_allocation.png"
+
+    results = (all_results or {}).get(config_name, [])
+    all_points: list[tuple] = []
+    for res in sorted(results, key=lambda r: r.get("window_index", 0)):
+        all_points.extend(res.get("effective_mult_by_day", []))
+
+    if not all_points:
+        fig, ax = plt.subplots(figsize=(14, 4))
+        ax.text(0.5, 0.5, f"No effective_mult data for '{config_name}'.",
+                ha="center", va="center", transform=ax.transAxes, fontsize=11)
+        ax.set_title(f"{config_name} — Effective allocation (no data)")
+        fig.savefig(out_path, dpi=150)
+        plt.close(fig)
+        return out_path
+
+    dates = pd.to_datetime([d for d, _ in all_points])
+    mults = np.array([m for _, m in all_points], dtype=float)
+
+    fig, ax = plt.subplots(figsize=(16, 5))
+
+    # Shade regions by allocation level
+    for i in range(len(dates)):
+        m = mults[i]
+        d = dates[i]
+        d_end = dates[i + 1] if i + 1 < len(dates) else d + pd.Timedelta(days=1)
+        if m == 0.0:
+            color, alpha = "#f8d7da", 0.6   # red: hard stop
+        elif m < 1.0:
+            color, alpha = "#fff3cd", 0.5   # yellow: partial
+        else:
+            color, alpha = "#d4edda", 0.35  # green: full
+
+        ax.axvspan(d, d_end, color=color, alpha=alpha, linewidth=0)
+
+    ax.plot(dates, mults, color="#1f3b6e", linewidth=1.0, label="effective_mult")
+    ax.axhline(1.0, color="#27ae60", linewidth=0.8, linestyle="--", alpha=0.7, label="Full (1.0)")
+    ax.axhline(0.0, color="#c0392b", linewidth=0.8, linestyle="--", alpha=0.7, label="Hard stop (0.0)")
+
+    ax.set_ylim(-0.05, 1.15)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+    ax.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
+    plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha="right")
+
+    import matplotlib.patches as mpatches
+    green_p  = mpatches.Patch(color="#d4edda", alpha=0.7, label="Full allocation")
+    yellow_p = mpatches.Patch(color="#fff3cd", alpha=0.7, label="Partially suppressed")
+    red_p    = mpatches.Patch(color="#f8d7da", alpha=0.7, label="Hard stop (0)")
+    ax.legend(handles=[green_p, yellow_p, red_p], loc="lower right", fontsize=9)
+
+    ax.set_xlabel("Date")
+    ax.set_ylabel("effective_mult")
+    ax.set_title(f"{config_name} — Daily effective allocation (vol_mult × cb_mult)", fontsize=13)
+    fig.tight_layout()
+
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
     return out_path

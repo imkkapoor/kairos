@@ -1333,6 +1333,12 @@ def insert_backtest_result(result: dict) -> int:
     Supports optional Phase 4.5 keys: use_vol_filter, avg_vix, pct_days_elevated.
     Supports optional Phase 4.6 keys: vroc_window, vroc_threshold, pct_days_spike.
     Supports optional Phase 4.7 keys: use_circuit_breaker, dd_trigger, dd_reset, pct_days_breaker_active.
+    Supports optional Phase 4.8 keys: use_soft_cb, cb_soft_start, cb_hard_stop, cb_min_mult,
+        avg_cb_mult, pct_days_chatter_held, use_crisis_pos_limits, crisis_max_positions,
+        min_dollar_risk, pct_signals_below_floor.
+    Supports optional category key: 'roos'.
+    Supports optional capital_mode key: 'capital_refresh' or 'capital_compounded'.
+    Supports optional config_origin key: 'manual' or 'predicted'.
     """
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -1346,7 +1352,12 @@ def insert_backtest_result(result: dict) -> int:
                     annualized_vol, currency, notes,
                     use_vol_filter, avg_vix, pct_days_elevated,
                     vroc_window, vroc_threshold, pct_days_spike,
-                    use_circuit_breaker, dd_trigger, dd_reset, pct_days_breaker_active
+                    use_circuit_breaker, dd_trigger, dd_reset, pct_days_breaker_active,
+                    use_soft_cb, cb_soft_start, cb_hard_stop, cb_min_mult,
+                    avg_cb_mult, pct_days_chatter_held,
+                    use_crisis_pos_limits, crisis_max_positions,
+                    min_dollar_risk, pct_signals_below_floor,
+                    category, config_origin, capital_mode
                 ) VALUES (
                     %s, %s, %s, %s, %s, %s,
                     %s, %s, %s, %s,
@@ -1355,7 +1366,12 @@ def insert_backtest_result(result: dict) -> int:
                     %s, %s, %s,
                     %s, %s, %s,
                     %s, %s, %s,
-                    %s, %s, %s, %s
+                    %s, %s, %s, %s,
+                    %s, %s, %s, %s,
+                    %s, %s,
+                    %s, %s,
+                    %s, %s,
+                    %s, %s, %s
                 ) RETURNING id
                 """,
                 (
@@ -1389,6 +1405,19 @@ def insert_backtest_result(result: dict) -> int:
                     result.get("dd_trigger"),
                     result.get("dd_reset"),
                     result.get("pct_days_breaker_active"),
+                    bool(result.get("use_soft_cb", False)),
+                    result.get("cb_soft_start"),
+                    result.get("cb_hard_stop"),
+                    result.get("cb_min_mult"),
+                    result.get("avg_cb_mult"),
+                    result.get("pct_days_chatter_held"),
+                    bool(result.get("use_crisis_pos_limits", False)),
+                    result.get("crisis_max_positions"),
+                    result.get("min_dollar_risk"),
+                    result.get("pct_signals_below_floor"),
+                    result.get("category", "roos"),
+                    result.get("config_origin", "manual"),
+                    result.get("capital_mode", "capital_refresh"),
                 ),
             )
             row = cur.fetchone()
@@ -1396,32 +1425,12 @@ def insert_backtest_result(result: dict) -> int:
 
 
 def get_backtest_summary(run_id: Optional[str] = None) -> pd.DataFrame:
-    """Return aggregate WFA metrics grouped by config_name, ordered by avg Sharpe DESC.
+    """Return aggregate ROOS metrics grouped by config_name, ordered by avg Sharpe DESC.
 
     If run_id is provided, only rows from that execution batch are included.
     """
     engine = get_engine()
-    if run_id:
-        query = text(
-            """
-            SELECT
-                config_name,
-                AVG(sharpe_ratio)    AS avg_sharpe,
-                AVG(calmar_ratio)    AS avg_calmar,
-                AVG(cagr)            AS avg_cagr,
-                AVG(max_drawdown)    AS avg_max_dd,
-                AVG(win_rate)        AS avg_win_rate,
-                COUNT(*)             AS windows_tested,
-                SUM(total_pnl_usd)   AS total_pnl
-            FROM backtest_results
-            WHERE run_id = :rid
-            GROUP BY config_name
-            ORDER BY avg_sharpe DESC NULLS LAST
-            """
-        )
-        return pd.read_sql(query, engine, params={"rid": run_id})
-    query = text(
-        """
+    _select = """
         SELECT
             config_name,
             AVG(sharpe_ratio)    AS avg_sharpe,
@@ -1430,12 +1439,16 @@ def get_backtest_summary(run_id: Optional[str] = None) -> pd.DataFrame:
             AVG(max_drawdown)    AS avg_max_dd,
             AVG(win_rate)        AS avg_win_rate,
             COUNT(*)             AS windows_tested,
-            SUM(total_pnl_usd)   AS total_pnl
+            SUM(total_pnl_usd)   AS total_pnl,
+            AVG(
+                total_pnl_usd / NULLIF(final_value_usd - total_pnl_usd, 0)
+            )                    AS avg_pnl_pct
         FROM backtest_results
-        GROUP BY config_name
-        ORDER BY avg_sharpe DESC NULLS LAST
-        """
-    )
+    """
+    if run_id:
+        query = text(_select + " WHERE run_id = :rid GROUP BY config_name ORDER BY avg_sharpe DESC NULLS LAST")
+        return pd.read_sql(query, engine, params={"rid": run_id})
+    query = text(_select + " GROUP BY config_name ORDER BY avg_sharpe DESC NULLS LAST")
     return pd.read_sql(query, engine)
 
 
@@ -1478,10 +1491,19 @@ def get_backtest_run_list() -> pd.DataFrame:
                 AVG(max_drawdown)                                         AS avg_max_dd,
                 AVG(win_rate)                                             AS avg_win_rate,
                 SUM(total_pnl_usd)                                        AS total_pnl_usd,
+                SUM(total_pnl_usd)
+                    / NULLIF(SUM(final_value_usd - total_pnl_usd), 0)    AS total_return_pct,
                 AVG(
                     total_pnl_usd / NULLIF(final_value_usd - total_pnl_usd, 0)
                 )                                                         AS avg_pnl_pct,
-                MIN(currency)                                             AS currency
+                MIN(currency)                                             AS currency,
+                BOOL_OR(COALESCE(use_vol_filter,        false))           AS any_vol_filter,
+                BOOL_OR(COALESCE(use_circuit_breaker,   false))           AS any_circuit_breaker,
+                BOOL_OR(COALESCE(use_soft_cb,           false))           AS any_soft_cb,
+                BOOL_OR(COALESCE(use_crisis_pos_limits, false))           AS any_crisis_pos_limits,
+                MIN(COALESCE(category, 'roos'))       AS category,
+                MIN(COALESCE(config_origin, 'manual'))                    AS config_origin,
+                MIN(COALESCE(capital_mode, 'capital_refresh'))            AS capital_mode
             FROM backtest_results
             WHERE run_id IS NOT NULL
             GROUP BY run_id

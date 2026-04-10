@@ -25,13 +25,13 @@ Why this script exists
 ----------------------
   `strategies/indicators.py:compute_all()` is designed for *daily* incremental use —
   it only writes today's single indicator bar per ticker.  This script writes the
-  FULL history needed by the Walk-Forward Analysis backtester (Phase 4).
+  FULL history needed by the Rolling Out-of-Sample (ROOS) backtester (Phase 4).
 
   Fresh setup order:
     make setup             (seeds watchlist + backfills OHLCV via yfinance)
     make hydrate-fx        (backfills USDCAD FX rates)
     make hydrate-indicators (this script — fills in all historical indicators)
-    make backtest          (Phase 4 WFA)
+    make backtest          (Phase 4 ROOS)
 
 Min bars required
 -----------------
