@@ -178,3 +178,17 @@ export interface Trade {
   signal_data: string | null;
   status: "filled" | "closed";
 }
+
+// GET /api/backtest/analytics (Phase 4.9)
+export interface BacktestAnalytics {
+  backtest_id: number;
+  equity_curve: number[];
+  drawdown_curve: number[];
+  monthly_returns: Record<string, Record<string, number>>;
+  regime_stats: Record<string, Record<string, number>>;
+  timestamps: string[];
+}
+
+export interface BacktestAnalyticsResponse {
+  analytics: BacktestAnalytics[];
+}

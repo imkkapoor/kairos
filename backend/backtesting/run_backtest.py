@@ -31,14 +31,14 @@ _logger.remove()
 
 from backtesting.config import CONFIGS, ROOS_DATA_START, ROOS_TRAIN_YEARS, ROOS_TEST_MONTHS, INITIAL_CAPITAL
 from backtesting.data_loader import generate_roos_windows
-from backtesting.portfolio_runner import run_roos, run_all_configs
-from backtesting.charts import generate_all_charts
+from backtesting.portfolio_runner import run_roos, run_all_configs, compute_analytics
 from db.connection import (
     ping,
     get_watchlist,
     get_sector_map,
     get_backtest_summary,
     insert_backtest_result,
+    insert_backtest_analytics,
 )
 
 
@@ -156,7 +156,6 @@ def _print_summary(summary_df, windows: list[dict], start_date, end_date) -> Non
         best_calmar = valid_c.loc[valid_c["avg_calmar"].idxmax(), "config_name"]
         print(f"  Best config by Avg Calmar: {best_calmar}")
 
-    print(f"\n  Charts saved to: backend/backtesting/output/")
     print(f"  Results saved to DB: backtest_results table")
     print("=" * 68)
 
@@ -246,6 +245,7 @@ def main() -> None:
     currency = os.environ.get("PORTFOLIO_CURRENCY", "CAD")
 
     all_results: dict[str, list[dict]] = {}
+    run_ids: list[str] = []
     n_total = len(configs_to_run) * len(capital_modes)
 
     if workers > 1:
@@ -306,60 +306,71 @@ def main() -> None:
                     )
 
                     run_id = str(uuid.uuid4())
+                    run_ids.append(run_id)
                     for res in win_results:
-                        db_row = {k: v for k, v in res.items() if k not in ("equity_curve", "circuit_breaker_days", "effective_mult_by_day")}
+                        db_row = {k: v for k, v in res.items() if k not in ("equity_curve", "circuit_breaker_days", "effective_mult_by_day", "trade_log")}
                         db_row["currency"] = currency
                         db_row["run_id"]   = run_id
-                        insert_backtest_result(db_row)
+                        bt_id = insert_backtest_result(db_row)
+                        analytics = compute_analytics(res)
+                        insert_backtest_analytics(bt_id, analytics)
                     result_key = f"{config_name}__{capital_mode}"
                     all_results[result_key] = win_results
     else:
         # ── Sequential mode ────────────────────────────────────────────
         from rich.console import Console as _Console
+        from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
         _console = _Console()
         run_idx = 0
 
         for capital_mode in capital_modes:
             mode_label = "compounded" if capital_mode == "capital_compounded" else "refresh"
-            _console.rule(f"[bold blue]{mode_label}[/bold blue]")
 
             for config_name, config in configs_to_run.items():
                 run_idx += 1
-                _console.rule(f"[bold green]{run_idx}/{n_total}  {config_name}[/bold green]")
+                tag = f"[dim]{run_idx}/{n_total}[/dim]  {config_name}  [cyan]{mode_label}[/cyan]"
 
-                win_results = run_roos(
-                    config, config_name, windows, tickers, sector_map,
-                    progress_prefix=f"[{run_idx}/{n_total}] ",
-                    capital_mode=capital_mode,
-                )
+                with Progress(
+                    SpinnerColumn(),
+                    TextColumn(f"  {{task.description}}"),
+                    TimeElapsedColumn(),
+                    console=_console,
+                    transient=True,
+                ) as _spinner:
+                    _tid = _spinner.add_task(tag, total=None)
+                    win_results = run_roos(
+                        config, config_name, windows, tickers, sector_map,
+                        progress_prefix=f"[{run_idx}/{n_total}] ",
+                        capital_mode=capital_mode,
+                        quiet=True,
+                    )
 
                 n_trades = sum(r.get("total_trades", 0) for r in win_results)
                 is_compounded = capital_mode == "capital_compounded"
                 detail = f"{n_trades} trades" if is_compounded else f"{len(win_results)} windows · {n_trades} trades"
-                _console.print(f"  [green]✓[/green] {config_name}  [dim]{detail}[/dim]")
+                _console.print(
+                    f"  [green]✓[/green] [bold]{config_name:<28}[/bold]  "
+                    f"[cyan]{mode_label}[/cyan]  [dim]{detail}[/dim]"
+                )
 
                 run_id = str(uuid.uuid4())
+                run_ids.append(run_id)
                 for res in win_results:
-                    db_row = {k: v for k, v in res.items() if k not in ("equity_curve", "circuit_breaker_days", "effective_mult_by_day")}
+                    db_row = {k: v for k, v in res.items() if k not in ("equity_curve", "circuit_breaker_days", "effective_mult_by_day", "trade_log")}
                     db_row["currency"] = currency
                     db_row["run_id"]   = run_id
-                    insert_backtest_result(db_row)
+                    bt_id = insert_backtest_result(db_row)
+                    analytics = compute_analytics(res)
+                    insert_backtest_analytics(bt_id, analytics)
 
                 result_key = f"{config_name}__{capital_mode}"
                 all_results[result_key] = win_results
 
-    # 7. Charts
-    print("\n  Generating charts…")
-    summary_df = get_backtest_summary()
-    try:
-        chart_paths = generate_all_charts(all_results, summary_df)
-        for p in chart_paths:
-            print(f"    Saved: {p.name}")
-    except Exception as exc:
-        print(f"  WARNING: Chart generation failed: {exc}")
-
-    # 8. Summary
-    _print_summary(summary_df, windows, ROOS_DATA_START, end_date)
+    # 7. Summary — show only configs from this run, not the full DB
+    print()
+    print("Backtest Complete")
+    print(f"Configs: {len(configs_to_run)}  |  Capital modes: {', '.join(capital_modes)}  |  Results saved to DB")
+    print("=======================================")
 
 
 if __name__ == "__main__":

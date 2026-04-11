@@ -87,7 +87,7 @@ Kairos tests how different **allocation configs** (strategy weight combinations)
 1. **Pre-flight** — ping DB, verify row counts in `price_data`, `indicators`, `fx_rates`
 2. **Generate 14 ROOS windows** — each window has a 2-year training period and a 6-month out-of-sample test period. Windows step forward by 6 months so the test periods never overlap
 3. **Load data once** — for each config, all OHLCV, indicators, and CADUSD rates for the full date range are loaded into memory in a single DB round-trip
-4. **Per-window simulation** — for each of the 18 test windows, the engine replays history day by day:
+4. **Per-window simulation** — for each of the 14 test windows, the engine replays history day by day:
    - At **Open**: check stop-loss and take-profit exits (same logic as live `run_morning`)
    - Run all **5 strategy functions** from `strategies/` (the live code, unmodified)
    - Apply **config weights** and **regime overrides** to signal strength
@@ -96,8 +96,7 @@ Kairos tests how different **allocation configs** (strategy weight combinations)
    - Record end-of-day portfolio value using **Close** prices
 5. **Compute metrics** per window — Sharpe ratio, Calmar ratio, CAGR, max drawdown, win rate, profit factor, annualised volatility
 6. **Store to DB** — one row per config per window in `backtest_results`
-7. **Generate 4 charts** per config → `backend/backtesting/output/`
-8. **Print summary table** — all configs ranked by avg Sharpe across all 14 windows
+7. **Print summary table** — all configs ranked by avg Sharpe across all 14 windows
 
 ### ROOS Pipeline
 
@@ -106,7 +105,7 @@ flowchart TD
     A["make backtest"] --> B["Pre-flight checks\n(ping DB, verify data counts)"]
     B --> C["generate_roos_windows()\n14 windows × 6-month steps\n2019-01 → 2026-01"]
     C --> D["get_watchlist() → ~600 tickers\nget_sector_map()"]
-    D --> E{"For each of\n16 allocation configs"}
+    D --> E{"For each of\n17 allocation configs"}
 
     E --> F["load_ohlcv() + load_indicators()\n+ load_fx_rates()\nFull range loaded ONCE"]
 
@@ -128,8 +127,7 @@ flowchart TD
     P --> Q["insert_backtest_result()\ninto backtest_results table"]
     Q --> G
 
-    G --> R["generate_all_charts()\nEquity curves · Heatmap\nDrawdown · Comparison"]
-    R --> S["Print summary table\nranked by Avg Sharpe"]
+    G --> S["Print summary table\nranked by Avg Sharpe"]
     S --> E
 ```
 
@@ -164,6 +162,7 @@ flowchart TD
 | `vol_adaptive_full_v2` | Soft CB + crisis pos limits + dollar floor | 0.10 | 20 | 4.8 |
 | `vol_adaptive_conservative_v2` | Conservative + full risk stack | 0.15 | 12 | 4.8 |
 | `adaptive_shield_v1` | Streamlined soft CB + regime adaptive | 0.10 | 20 | Latest |
+| `vol_recovery_v1` | Soft CB + multi-trigger recovery + dynamic floor | 0.10 | 20 | 4.10 |
 
 Results in `backtest_results` table. Query with `make shell-db`:
 ```sql
@@ -196,7 +195,7 @@ FROM backtest_results GROUP BY config_name ORDER BY avg_sharpe DESC;
 | `hydrate-indicators`  | Backfill full historical indicators for all tickers (for backtesting)|
 | `hydrate-fx`          | Backfill USDCAD FX rates from 2017                                  |
 | `fetch-vix`           | One-time VIX history backfill from 2017-01-02 (run before backtest) |
-| `backtest`            | ROOS backtest across all 16 allocation configs (~14 windows each)    |
+| `backtest`            | ROOS backtest across all 17 allocation configs (~14 windows each)    |
 | `backtest-config`     | ROOS backtest for one config — `CONFIG=regime_adaptive`              |
 | `shell-db`            | Open `psql` session                                                 |
 | `reset-db`            | **DESTRUCTIVE** — wipe all data and recreate the database           |
@@ -232,10 +231,9 @@ kairos/
 │   │   ├── portfolio.py            ← in-memory portfolio with risk limits
 │   │   └── position_manager.py     ← stop/TP/trailing stop checker
 │   ├── backtesting/
-│   │   ├── config.py               ← ROOS params + 16 allocation configs
+│   │   ├── config.py               ← ROOS params + 17 allocation configs
 │   │   ├── data_loader.py          ← DB data loading + ROOS window generation
 │   │   ├── portfolio_runner.py     ← day-by-day simulation engine
-│   │   ├── charts.py               ← matplotlib charts → backtesting/output/
 │   │   └── run_backtest.py         ← CLI entry point (make backtest)
 │   ├── scheduler.py                ← long-running weekday job runner
 │   ├── setup.py                    ← one-time init script
@@ -317,6 +315,7 @@ All strategies are regime-filtered (TRENDING / CHOPPY / CRISIS) and volume-confi
 | 4.6   | VROC spike trigger                  | ✅ Complete      |
 | 4.7   | Drawdown circuit breakers           | ✅ Complete      |
 | 4.8   | Soft CB + crisis limits + floor     | ✅ Complete      |
+| 4.10  | Multi-trigger recovery + dynamic floor | ✅ Complete    |
 | 5     | Risk analytics (live side)          | ⬜ Pending       |
 | 6     | AI / sentiment layer                | ⬜ Pending       |
 | 7     | Dashboard + notifier                | 🔧 In progress   |

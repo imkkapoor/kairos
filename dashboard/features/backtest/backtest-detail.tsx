@@ -1,13 +1,23 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useMemo } from "react";
 import Link from "next/link";
 import { ArrowLeft, ChevronDown, ChevronRight } from "lucide-react";
-import { useBacktest } from "@/lib/api/queries";
+import { useBacktest, useBacktestAnalytics } from "@/lib/api/queries";
 import { DataTable } from "@/components/ui/data-table";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { backtestColumns } from "./columns";
-import type { BacktestRun, BacktestSummary } from "@/lib/types/api";
+import {
+  EquityCurveChart,
+  DrawdownCurveChart,
+  MonthlyReturnsHeatmap,
+  RegimeStatsHeatmap,
+} from "./backtest-charts";
+import type {
+  BacktestRun,
+  BacktestSummary,
+  BacktestAnalytics,
+} from "@/lib/types/api";
 
 function pct(v: number | null, d = 1) {
   return v == null ? "—" : `${(v * 100).toFixed(d)}%`;
@@ -64,7 +74,7 @@ function SummaryCard({ s, runs }: { s: BacktestSummary; runs: BacktestRun[] }) {
   const isCompounded = capitalMode === "capital_compounded";
 
   // For compounded: single run, use its values directly
-  const singleRun = isCompounded ? configRuns[0] ?? null : null;
+  const singleRun = isCompounded ? (configRuns[0] ?? null) : null;
   const finalPortfolioValue = singleRun?.final_value_usd ?? null;
 
   return (
@@ -120,7 +130,9 @@ function SummaryCard({ s, runs }: { s: BacktestSummary; runs: BacktestRun[] }) {
             </div>
           )}
           <div>
-            <p className="text-[10px] text-muted-foreground">{isCompounded ? "Sharpe" : "Avg Sharpe"}</p>
+            <p className="text-[10px] text-muted-foreground">
+              {isCompounded ? "Sharpe" : "Avg Sharpe"}
+            </p>
             <p
               className={`text-lg font-semibold tabular-nums ${
                 s.avg_sharpe != null && s.avg_sharpe >= 1 ? "text-profit" : ""
@@ -130,13 +142,17 @@ function SummaryCard({ s, runs }: { s: BacktestSummary; runs: BacktestRun[] }) {
             </p>
           </div>
           <div>
-            <p className="text-[10px] text-muted-foreground">{isCompounded ? "CAGR" : "Avg CAGR"}</p>
+            <p className="text-[10px] text-muted-foreground">
+              {isCompounded ? "CAGR" : "Avg CAGR"}
+            </p>
             <p className="text-lg font-semibold tabular-nums">
               {pct(s.avg_cagr)}
             </p>
           </div>
           <div>
-            <p className="text-[10px] text-muted-foreground">{isCompounded ? "Max DD" : "Avg Max DD"}</p>
+            <p className="text-[10px] text-muted-foreground">
+              {isCompounded ? "Max DD" : "Avg Max DD"}
+            </p>
             <p className="text-lg font-semibold tabular-nums text-loss">
               {pct(s.avg_max_dd)}
             </p>
@@ -154,26 +170,39 @@ function SummaryCard({ s, runs }: { s: BacktestSummary; runs: BacktestRun[] }) {
         {/* ── Detail stats ── */}
         <div className="grid grid-cols-2 gap-x-8 gap-y-1.5 sm:grid-cols-3">
           <div className="flex items-baseline justify-between gap-2">
-            <span className="whitespace-nowrap text-muted-foreground">{isCompounded ? "Calmar" : "Avg Calmar"}</span>
-            <span className="font-medium tabular-nums">{num(s.avg_calmar)}</span>
+            <span className="whitespace-nowrap text-muted-foreground">
+              {isCompounded ? "Calmar" : "Avg Calmar"}
+            </span>
+            <span className="font-medium tabular-nums">
+              {num(s.avg_calmar)}
+            </span>
           </div>
           {isCompounded && singleRun && (
             <div className="flex items-baseline justify-between gap-2">
-              <span className="whitespace-nowrap text-muted-foreground">Period</span>
+              <span className="whitespace-nowrap text-muted-foreground">
+                Period
+              </span>
               <span className="font-mono font-medium tabular-nums text-xs">
-                {(singleRun.window_start as string).slice(0, 7)} → {(singleRun.window_end as string).slice(0, 7)}
+                {(singleRun.window_start as string).slice(0, 7)} →{" "}
+                {(singleRun.window_end as string).slice(0, 7)}
               </span>
             </div>
           )}
           {isCompounded && singleRun && (
             <div className="flex items-baseline justify-between gap-2">
-              <span className="whitespace-nowrap text-muted-foreground">Trades</span>
-              <span className="font-medium tabular-nums">{singleRun.total_trades}</span>
+              <span className="whitespace-nowrap text-muted-foreground">
+                Trades
+              </span>
+              <span className="font-medium tabular-nums">
+                {singleRun.total_trades}
+              </span>
             </div>
           )}
           {!isCompounded && (
             <div className="flex items-baseline justify-between gap-2">
-              <span className="whitespace-nowrap text-muted-foreground">Avg PnL / Window</span>
+              <span className="whitespace-nowrap text-muted-foreground">
+                Avg PnL / Window
+              </span>
               <span
                 className={`font-medium tabular-nums ${
                   s.avg_pnl_pct != null && s.avg_pnl_pct >= 0
@@ -187,25 +216,45 @@ function SummaryCard({ s, runs }: { s: BacktestSummary; runs: BacktestRun[] }) {
           )}
           {!isCompounded && (
             <div className="flex items-baseline justify-between gap-2">
-              <span className="whitespace-nowrap text-muted-foreground">Windows</span>
-              <span className="font-medium tabular-nums">{s.windows_tested}</span>
+              <span className="whitespace-nowrap text-muted-foreground">
+                Windows
+              </span>
+              <span className="font-medium tabular-nums">
+                {s.windows_tested}
+              </span>
             </div>
           )}
           <div className="flex items-baseline justify-between gap-2">
-            <span className="whitespace-nowrap text-muted-foreground">Profit Factor</span>
-            <span className="font-medium tabular-nums">{num(stats.avgProfitFactor)}</span>
+            <span className="whitespace-nowrap text-muted-foreground">
+              Profit Factor
+            </span>
+            <span className="font-medium tabular-nums">
+              {num(stats.avgProfitFactor)}
+            </span>
           </div>
           <div className="flex items-baseline justify-between gap-2">
-            <span className="whitespace-nowrap text-muted-foreground">Avg Win %</span>
-            <span className="font-medium tabular-nums text-profit">{pct(stats.avgWinPct)}</span>
+            <span className="whitespace-nowrap text-muted-foreground">
+              Avg Win %
+            </span>
+            <span className="font-medium tabular-nums text-profit">
+              {pct(stats.avgWinPct)}
+            </span>
           </div>
           <div className="flex items-baseline justify-between gap-2">
-            <span className="whitespace-nowrap text-muted-foreground">Avg Loss %</span>
-            <span className="font-medium tabular-nums text-loss">{pct(stats.avgLossPct)}</span>
+            <span className="whitespace-nowrap text-muted-foreground">
+              Avg Loss %
+            </span>
+            <span className="font-medium tabular-nums text-loss">
+              {pct(stats.avgLossPct)}
+            </span>
           </div>
           <div className="flex items-baseline justify-between gap-2">
-            <span className="whitespace-nowrap text-muted-foreground">Ann. Volatility</span>
-            <span className="font-medium tabular-nums">{pct(stats.avgAnnVol)}</span>
+            <span className="whitespace-nowrap text-muted-foreground">
+              Ann. Volatility
+            </span>
+            <span className="font-medium tabular-nums">
+              {pct(stats.avgAnnVol)}
+            </span>
           </div>
         </div>
 
@@ -216,38 +265,62 @@ function SummaryCard({ s, runs }: { s: BacktestSummary; runs: BacktestRun[] }) {
             <div className="grid grid-cols-2 gap-x-8 gap-y-1.5 sm:grid-cols-3">
               {isFiltered && stats.avgVix != null && (
                 <div className="flex items-baseline justify-between gap-2">
-                  <span className="whitespace-nowrap text-muted-foreground">Avg VIX</span>
-                  <span className="font-medium tabular-nums">{stats.avgVix.toFixed(1)}</span>
+                  <span className="whitespace-nowrap text-muted-foreground">
+                    Avg VIX
+                  </span>
+                  <span className="font-medium tabular-nums">
+                    {stats.avgVix.toFixed(1)}
+                  </span>
                 </div>
               )}
               {isFiltered && stats.pctElevated != null && (
                 <div className="flex items-baseline justify-between gap-2">
-                  <span className="whitespace-nowrap text-muted-foreground">High+Extreme Days</span>
-                  <span className="font-medium tabular-nums">{pct(stats.pctElevated)}</span>
+                  <span className="whitespace-nowrap text-muted-foreground">
+                    High+Extreme Days
+                  </span>
+                  <span className="font-medium tabular-nums">
+                    {pct(stats.pctElevated)}
+                  </span>
                 </div>
               )}
               {isFiltered && stats.pctDaysSpike != null && (
                 <div className="flex items-baseline justify-between gap-2">
-                  <span className="whitespace-nowrap text-muted-foreground">VROC Spike Days</span>
-                  <span className="font-medium tabular-nums">{pct(stats.pctDaysSpike)}</span>
+                  <span className="whitespace-nowrap text-muted-foreground">
+                    VROC Spike Days
+                  </span>
+                  <span className="font-medium tabular-nums">
+                    {pct(stats.pctDaysSpike)}
+                  </span>
                 </div>
               )}
               {(hasSoftCb || hasCb) && stats.pctDaysBreakerActive != null && (
                 <div className="flex items-baseline justify-between gap-2">
-                  <span className="whitespace-nowrap text-muted-foreground">CB Active Days</span>
-                  <span className="font-medium tabular-nums">{pct(stats.pctDaysBreakerActive)}</span>
+                  <span className="whitespace-nowrap text-muted-foreground">
+                    CB Active Days
+                  </span>
+                  <span className="font-medium tabular-nums">
+                    {pct(stats.pctDaysBreakerActive)}
+                  </span>
                 </div>
               )}
               {hasSoftCb && stats.avgCbMult != null && (
                 <div className="flex items-baseline justify-between gap-2">
-                  <span className="whitespace-nowrap text-muted-foreground">Avg CB Mult</span>
-                  <span className="font-medium tabular-nums">{stats.avgCbMult.toFixed(2)}\u00d7</span>
+                  <span className="whitespace-nowrap text-muted-foreground">
+                    Avg CB Mult
+                  </span>
+                  <span className="font-medium tabular-nums">
+                    {stats.avgCbMult.toFixed(2)}\u00d7
+                  </span>
                 </div>
               )}
               {hasSoftCb && stats.pctDaysChatterHeld != null && (
                 <div className="flex items-baseline justify-between gap-2">
-                  <span className="whitespace-nowrap text-muted-foreground">Chatter Hold Days</span>
-                  <span className="font-medium tabular-nums">{pct(stats.pctDaysChatterHeld)}</span>
+                  <span className="whitespace-nowrap text-muted-foreground">
+                    Chatter Hold Days
+                  </span>
+                  <span className="font-medium tabular-nums">
+                    {pct(stats.pctDaysChatterHeld)}
+                  </span>
                 </div>
               )}
             </div>
@@ -290,6 +363,92 @@ interface BacktestDetailProps {
 
 export function BacktestDetail({ runId }: BacktestDetailProps) {
   const { data, isLoading, isError, error } = useBacktest(runId);
+  const { data: analyticsData } = useBacktestAnalytics(runId);
+
+  const firstRun = data?.runs[0];
+  const isCompounded = firstRun?.capital_mode === "capital_compounded";
+
+  // For compounded: use the single analytics row directly.
+  // For refresh: merge all per-window analytics into one combined view.
+  // Must be called unconditionally before any early returns.
+  const analytics: BacktestAnalytics | null = useMemo(() => {
+    const rows = analyticsData?.analytics;
+    if (!rows?.length) return null;
+
+    if (isCompounded || rows.length === 1) return rows[0];
+
+    // Merge per-window analytics: concatenate curves, merge monthly & regime
+    const merged: BacktestAnalytics = {
+      backtest_id: rows[0].backtest_id,
+      equity_curve: [],
+      drawdown_curve: [],
+      monthly_returns: {},
+      regime_stats: {},
+      timestamps: [],
+    };
+
+    for (const row of rows) {
+      merged.equity_curve.push(...(row.equity_curve ?? []));
+      merged.drawdown_curve.push(...(row.drawdown_curve ?? []));
+      merged.timestamps.push(...(row.timestamps ?? []));
+
+      // Merge monthly returns: take per-year data from each window
+      if (row.monthly_returns) {
+        for (const [yr, months] of Object.entries(row.monthly_returns)) {
+          if (!merged.monthly_returns[yr]) {
+            merged.monthly_returns[yr] = { ...months };
+          } else {
+            for (const [m, v] of Object.entries(months)) {
+              if (m !== "annual") {
+                if (merged.monthly_returns[yr][m] == null) {
+                  merged.monthly_returns[yr][m] = v;
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // Merge regime stats: sum PnL across windows
+      if (row.regime_stats) {
+        for (const [strat, regimes] of Object.entries(row.regime_stats)) {
+          if (!merged.regime_stats[strat]) {
+            merged.regime_stats[strat] = {};
+          }
+          for (const [reg, pnl] of Object.entries(regimes)) {
+            merged.regime_stats[strat][reg] =
+              (merged.regime_stats[strat][reg] ?? 0) + pnl;
+          }
+        }
+      }
+    }
+
+    // Recompute annual returns from merged monthly data
+    const MONTHS = [
+      "Jan",
+      "Feb",
+      "Mar",
+      "Apr",
+      "May",
+      "Jun",
+      "Jul",
+      "Aug",
+      "Sep",
+      "Oct",
+      "Nov",
+      "Dec",
+    ];
+    for (const [yr, months] of Object.entries(merged.monthly_returns)) {
+      let annual = 1.0;
+      for (const m of MONTHS) {
+        if (months[m] != null) annual *= 1 + months[m];
+      }
+      merged.monthly_returns[yr].annual =
+        Math.round((annual - 1) * 10000) / 10000;
+    }
+
+    return merged;
+  }, [analyticsData, isCompounded]);
 
   if (isError) throw error;
 
@@ -305,7 +464,10 @@ export function BacktestDetail({ runId }: BacktestDetailProps) {
               <CardContent>
                 <div className="space-y-2">
                   {Array.from({ length: 8 }).map((_, j) => (
-                    <div key={j} className="h-3 w-full animate-pulse rounded bg-muted" />
+                    <div
+                      key={j}
+                      className="h-3 w-full animate-pulse rounded bg-muted"
+                    />
                   ))}
                 </div>
               </CardContent>
@@ -316,8 +478,6 @@ export function BacktestDetail({ runId }: BacktestDetailProps) {
       </div>
     );
   }
-
-  const firstRun = data.runs[0];
 
   return (
     <div className="space-y-6">
@@ -350,7 +510,9 @@ export function BacktestDetail({ runId }: BacktestDetailProps) {
                   : "bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300"
               }`}
             >
-              {firstRun.capital_mode === "capital_compounded" ? "Compounded" : "Refresh"}
+              {firstRun.capital_mode === "capital_compounded"
+                ? "Compounded"
+                : "Refresh"}
             </span>
           </>
         )}
@@ -373,16 +535,31 @@ export function BacktestDetail({ runId }: BacktestDetailProps) {
         </div>
       )}
 
-      {/* Config parameters (collapsible) */}
-      {firstRun?.config && (
-        <ConfigPanel config={firstRun.config as Record<string, unknown>} />
-      )}
-
       {/* Per-window table — only shown in refresh mode */}
       {firstRun?.capital_mode !== "capital_compounded" && (
         <DataTable columns={backtestColumns} data={data.runs} filters={[]} />
       )}
+
+      {/* Analytics charts */}
+      {analytics && (
+        <div className="space-y-4">
+          <EquityCurveChart
+            analytics={analytics}
+            perWindowAnalytics={!isCompounded ? analyticsData?.analytics : undefined}
+            runs={!isCompounded ? data.runs : undefined}
+          />
+          {!isCompounded && <DrawdownCurveChart analytics={analytics} />}
+          <div className="grid grid-cols-1 xl:grid-cols-2 gap-4 items-start">
+            <MonthlyReturnsHeatmap analytics={analytics} />
+            <RegimeStatsHeatmap analytics={analytics} />
+          </div>
+        </div>
+      )}
+
+      {/* Config parameters (collapsible) */}
+      {firstRun?.config && (
+        <ConfigPanel config={firstRun.config as Record<string, unknown>} />
+      )}
     </div>
   );
 }
-

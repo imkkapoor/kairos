@@ -1512,3 +1512,59 @@ def get_backtest_run_list() -> pd.DataFrame:
         ),
         engine,
     )
+
+
+# ---------------------------------------------------------------------------
+# Backtest analytics (Phase 4.9)
+# ---------------------------------------------------------------------------
+
+def insert_backtest_analytics(backtest_id: int, analytics: dict) -> int:
+    """Insert pre-computed chart data for a backtest window. Returns the new row id.
+
+    analytics dict keys: equity_curve, drawdown_curve, monthly_returns,
+    regime_stats, timestamps.
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO backtest_analytics
+                    (backtest_id, equity_curve, drawdown_curve, monthly_returns, regime_stats, timestamps)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (backtest_id) DO UPDATE SET
+                    equity_curve    = EXCLUDED.equity_curve,
+                    drawdown_curve  = EXCLUDED.drawdown_curve,
+                    monthly_returns = EXCLUDED.monthly_returns,
+                    regime_stats    = EXCLUDED.regime_stats,
+                    timestamps      = EXCLUDED.timestamps
+                RETURNING id
+                """,
+                (
+                    backtest_id,
+                    json.dumps(analytics.get("equity_curve")),
+                    json.dumps(analytics.get("drawdown_curve")),
+                    json.dumps(analytics.get("monthly_returns")),
+                    json.dumps(analytics.get("regime_stats")),
+                    json.dumps(analytics.get("timestamps")),
+                ),
+            )
+            return cur.fetchone()[0]
+
+
+def get_backtest_analytics(backtest_ids: list[int]) -> list[dict]:
+    """Return analytics rows for a list of backtest_result ids."""
+    if not backtest_ids:
+        return []
+    engine = get_engine()
+    query = text(
+        """
+        SELECT backtest_id, equity_curve, drawdown_curve, monthly_returns,
+               regime_stats, timestamps
+        FROM backtest_analytics
+        WHERE backtest_id = ANY(:ids)
+        ORDER BY backtest_id ASC
+        """
+    )
+    with engine.connect() as conn:
+        rows = conn.execute(query, {"ids": backtest_ids}).mappings().all()
+    return [dict(r) for r in rows]

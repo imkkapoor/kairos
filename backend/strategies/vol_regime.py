@@ -198,10 +198,21 @@ def get_vix_regime(
         regime    = "HIGH"
         size_mult = 0.35
 
+    # Compute VROC ratio (vix / trailing_sma - 1) for debug/logging visibility
+    vroc_ratio = 0.0
+    if vix_value is not None:
+        target_ts = pd.Timestamp(as_of_date, tz="UTC")
+        _prior = vix_series[vix_series.index <= target_ts]
+        if len(_prior) >= sma_window:
+            _sma = float(_prior.iloc[-sma_window:].mean())
+            if _sma > 0:
+                vroc_ratio = vix_value / _sma - 1.0
+
     return {
         "vix": vix_value,
         "regime": regime,
         "size_mult": size_mult,
         "suppressed": SUPPRESSED_STRATEGIES.get(regime, set()).copy(),
         "spike_triggered": spike,
+        "vroc_ratio": vroc_ratio,
     }

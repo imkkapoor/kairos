@@ -11,6 +11,7 @@ stack built across Phases 4.5 – 4.8:
 - **Phase 4.6** — VROC spike trigger (Section 9.4)
 - **Phase 4.7** — Binary drawdown circuit breaker (Section 9.5)
 - **Phase 4.8** — Soft CB + vol-adjusted reset + crisis position limits + dollar floor (Section 9.6)
+- **Phase 4.10** — Multi-trigger recovery + dynamic risk floor (Section 9.7)
 
 Sections 1–8 and the core signal formulas are identical to the live system.
 The live executor does **not** yet use `vol_regime.py` — that wiring is a future phase.
@@ -417,6 +418,57 @@ position sizing. This filters out very small positions that consume a slot in
 `max_open_positions` without meaningful contribution. Stored in metrics:
 `pct_signals_below_floor`.
 
+### 9.7 Multi-Trigger Recovery + Dynamic Risk Floor  *(Phase 4.10)*
+
+Phase 4.8 introduced the soft CB, but a known problem remained: once a circuit
+breaker trips (especially at `cb_mult=0.0`), the bot flatlines permanently.
+It waits for an equity recovery that it cannot participate in — a "Risk Deadlock."
+
+Phase 4.10 solves this with two changes.
+
+#### Change A — "Whichever Comes First" Recovery
+
+The CB resets from OFF (or its minimum multiplier) back to ACTIVE if **any**
+of three conditions are met:
+
+| # | Trigger | Condition | Rationale |
+|---|---------|-----------|-----------|
+| 1 | **Market** | 3-day trailing average of `VIX < vix_recovery_threshold` (default 25) sustained for `vix_recovery_days` (default 3) consecutive trading days | Smooths single-day VIX flickers (e.g. 24.5 → 26.0) that would cause the CB to stutter open and re-trip |
+| 2 | **Time** | `current_day > trip_day + cooldown_period` (default 21 trading days) | "Penalty Box" — time-based release regardless of conditions |
+| 3 | **Equity** | `current_drawdown < dd_reset_threshold` (default 3%) | Legacy logic — portfolio has organically recovered |
+
+When a recovery fires:
+- `cb_mult` resets to `1.0`
+- `soft_cb_was_active` resets to `False`
+- The trip day counter and VIX streak counter both reset
+- `soft_peak_dd` resets to `0.0` so the soft CB starts fresh
+
+**Config keys:** `cooldown_period` (21), `vix_recovery_threshold` (25.0),
+`vix_recovery_days` (3), `dd_reset_threshold` (0.03)
+
+All four are configurable per allocation config, enabling grid-search over
+different "Penalty Box" lengths and VIX thresholds.
+
+Stored in metrics: `recovery_trigger_count` — how many times the CB reset
+during a window via one of the three triggers.
+
+#### Change B — Dynamic Risk Floor
+
+The fixed `min_dollar_risk` floor (e.g. $500) killed all trades when the soft
+CB scaled positions to 0.25× — `$500 × 0.25 = $125` risk positions never
+passed the $500 floor check.
+
+**Fix:** The floor now scales with the CB multiplier:
+
+```
+effective_min_risk = min_dollar_risk × max(effective_mult, 0.01)
+```
+
+At `effective_mult = 0.25`, the floor drops to `$500 × 0.25 = $125`, allowing
+"micro-trades" that begin the recovery process. The `0.01` lower bound
+prevents division-by-zero semantics when `effective_mult = 0.0` (hard stop
+still blocks all BUYs via the `effective_mult == 0.0` check above).
+
 ---
 
 ## 10. Z-Score Normalisation
@@ -541,6 +593,7 @@ to Phase 4 baseline configs.
 | `vol_adaptive_full_v2` | conservative + crisis limits + floor | 0.10 | 20 | 30% | ✓ | ✓ | soft | 4.8 |
 | `vol_adaptive_conservative_v2` | conservative + full stack | 0.15 | 12 | 20% | ✓ | ✓ | soft | 4.8 |
 | `adaptive_shield_v1` | conservative weights + overrides | 0.10 | 20 | 30% | ✓ | – | soft | Latest |
+| `vol_recovery_v1` | conservative + crisis + recovery triggers | 0.10 | 20 | 30% | ✓ | ✓ | soft + recovery | 4.10 |
 
 *Columns: `min_str` = min\_strength, Pos = max\_open\_positions, Sec = max\_sector\_exposure, Vol = use\_vol\_filter, CB = circuit breaker type.*
 
@@ -605,6 +658,11 @@ All metrics are stored as one row per config per ROOS window.
 | `crisis_max_positions`    | `use_crisis_pos_limits=True`                | Max positions during HIGH/EXTREME |
 | `min_dollar_risk`         | Always                                      | Dollar floor for position sizing |
 | `pct_signals_below_floor` | `min_dollar_risk > 0`                       | Signals discarded by floor / total attempts |
+| `cooldown_period`         | `use_soft_cb=True`                          | Penalty box length in trading days |
+| `vix_recovery_threshold`  | `use_soft_cb=True`                          | 3-day average VIX level that triggers market recovery |
+| `vix_recovery_days`       | `use_soft_cb=True`                          | Consecutive days the 3-day VIX average must stay below threshold |
+| `dd_reset_threshold`      | `use_soft_cb=True`                          | Drawdown level that triggers equity recovery |
+| `recovery_trigger_count`  | `use_soft_cb=True`                          | Times the CB reset via multi-trigger recovery |
 
 ---
 

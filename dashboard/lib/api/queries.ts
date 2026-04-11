@@ -7,6 +7,7 @@ import type {
   BacktestResponse,
   BacktestRunListResponse,
   TickerChartResponse,
+  BacktestAnalyticsResponse,
 } from "../types/api";
 
 // ---------------------------------------------------------------------------
@@ -18,6 +19,7 @@ export const queryKeys = {
   ticker: (ticker: string, range: string) => ["ticker", ticker, range] as const,
   backtest: (runId?: string) => ["backtest", runId ?? "all"] as const,
   backtestRuns: ["backtest-runs"] as const,
+  backtestAnalytics: (runId: string) => ["backtest-analytics", runId] as const,
 };
 
 // ---------------------------------------------------------------------------
@@ -48,6 +50,13 @@ async function fetchBacktest(runId?: string): Promise<BacktestResponse> {
 
 async function fetchBacktestRuns(): Promise<BacktestRunListResponse> {
   const res = await apiClient.get<BacktestRunListResponse>("/api/backtest/runs");
+  return res.data;
+}
+
+async function fetchBacktestAnalytics(runId: string): Promise<BacktestAnalyticsResponse> {
+  const res = await apiClient.get<BacktestAnalyticsResponse>(
+    `/api/backtest/analytics?run_id=${encodeURIComponent(runId)}`,
+  );
   return res.data;
 }
 
@@ -95,5 +104,13 @@ export function useTickerChart(ticker: string | null, range: string) {
     queryFn: () => fetchTickerChart(ticker!, range),
     enabled: !!ticker,
     staleTime: 60_000,
+  });
+}
+
+export function useBacktestAnalytics(runId: string) {
+  return useQuery({
+    queryKey: queryKeys.backtestAnalytics(runId),
+    queryFn: () => fetchBacktestAnalytics(runId),
+    staleTime: 5 * 60_000,
   });
 }

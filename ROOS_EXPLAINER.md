@@ -79,7 +79,6 @@ flowchart TD
     F14 --> G
 
     G --> H[insert_backtest_result\nPostgres · backtest_results\nwith category column]
-    G --> I[generate_all_charts\nequity curves · drawdown\nallocation heatmap]
 ```
 
 ---
@@ -98,7 +97,7 @@ flowchart LR
         P4["4. Regime detection\ntrending / choppy / crisis"]
         P5["5. Stop-loss / take-profit\nexits at today's Open"]
         P6["6. VIX regime\nNORMAL / ELEVATED / HIGH / EXTREME"]
-        P7["7. Soft CB multiplier\n0.0 – 1.0 scalar"]
+        P7["7. Soft CB multiplier\n+ multi-trigger recovery\n0.0 – 1.0 scalar"]
         P8["8. Generate signals\nRSI · Momentum · MACD\nReversal · Sector Rotation"]
         P9["9. Apply weights\nstrategy_weights × regime_override"]
         P10["10. Z-score sort\ncross-universe ranking"]
@@ -318,9 +317,67 @@ EXTREME         →  hold for 12 days
 
 ---
 
+## Multi-Trigger Recovery — Breaking Risk Deadlocks (Phase 4.10)
+
+Phase 4.8's soft CB had a critical flaw: once `cb_mult` hit `0.0` (hard stop at 12% drawdown), the bot flatlined permanently. It waited for an equity recovery it couldn't participate in — a "Risk Deadlock."
+
+Phase 4.10 solves this with a **"whichever comes first"** recovery mechanism. The CB resets if **any** of three conditions fire:
+
+### Condition 1 — Market Recovery (VIX-based)
+
+```
+3-day trailing average of VIX < vix_recovery_threshold (default 25)
+sustained for vix_recovery_days (default 3) consecutive trading days
+```
+
+This confirms the fear regime has genuinely shifted rather than a single-day dip. The 3-day average smooths out intraday VIX flickers (e.g. 24.5 → 26.0 → 24.5) that would otherwise cause the CB to stutter open and re-trip. VIX is already loaded by the data pipeline and checked daily in the backtest loop.
+
+### Condition 2 — Time Recovery (Penalty Box)
+
+```
+current_trading_day > trip_day + cooldown_period (default 21 trading days)
+```
+
+After ~1 calendar month in the penalty box, the CB releases regardless. This prevents permanent lockout in slowly-recovering markets where VIX stays elevated but the opportunity set has improved.
+
+### Condition 3 — Equity Recovery (Legacy)
+
+```
+current_drawdown < dd_reset_threshold (default 3%)
+```
+
+If the portfolio recovers organically (e.g. existing positions rally), the CB releases once drawdown shrinks below the threshold.
+
+### On Recovery
+
+When any trigger fires:
+- `cb_mult` resets to **1.0** (full sizing)
+- Peak drawdown tracking resets to `0.0`
+- Trip day counter and VIX streak counter reset
+- The bot can immediately begin "micro-trades" to rebuild
+
+### Dynamic Risk Floor
+
+The static `min_dollar_risk` floor (e.g. $500) was too aggressive during CB scaling. At `effective_mult = 0.25`, positions worth $125 risk were blocked by the $500 floor.
+
+**Fix:** `effective_min_risk = min_dollar_risk × effective_mult`
+
+This allows the bot to take small recovery positions proportional to its current risk budget.
+
+### Config Keys
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `cooldown_period` | 21 | Trading days before time-based recovery |
+| `vix_recovery_threshold` | 25.0 | 3-day average VIX must be below this level |
+| `vix_recovery_days` | 3 | Consecutive days the 3-day VIX average must stay below threshold |
+| `dd_reset_threshold` | 0.03 | Drawdown must be below 3% for equity recovery |
+
+---
+
 ## How Metrics Roll Up
 
-After all windows complete, `_print_summary()` aggregates across windows:
+After all windows complete, the backtest runner aggregates across windows:
 
 ```
 aggregate_pnl       = sum(window.total_pnl_usd)
@@ -366,7 +423,7 @@ flowchart TD
 
     G["ATR position sizing\ndollar_risk = strength\n× MAX_PORTFOLIO_RISK\n× portfolio_value\n× size_mult × cb_mult"] --> H
 
-    H{"dollar_risk\n≥ min_dollar_risk?"} -->|No – floor skip| Z3([discard])
+    H{\"dollar_risk\n≥ effective_min_risk?\"}  -->|No – floor skip| Z3([discard])
     H -->|Yes| I
 
     I["qty = floor(dollar_risk / risk_per_share)\ncap to max_position_size × portfolio_value\ncap to remaining exposure budget"] --> J

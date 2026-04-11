@@ -28,6 +28,7 @@ from db.connection import (
     get_backtest_summary,
     get_backtest_run_list,
     get_price_data,
+    get_backtest_analytics,
 )
 
 # ---------------------------------------------------------------------------
@@ -247,6 +248,20 @@ def get_backtest_runs():
     try:
         df = get_backtest_run_list()
         return {"runs": [_serialise(row.to_dict()) for _, row in df.iterrows()]}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/backtest/analytics")
+def get_analytics(run_id: str):
+    """Pre-computed chart data (equity curve, drawdown, heatmaps) for a backtest run."""
+    try:
+        df = get_backtest_results(run_id=run_id)
+        if df.empty:
+            return {"analytics": []}
+        backtest_ids = df["id"].tolist()
+        rows = get_backtest_analytics(backtest_ids)
+        return {"analytics": [_serialise(r) for r in rows]}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 

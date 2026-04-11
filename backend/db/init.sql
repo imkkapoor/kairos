@@ -202,6 +202,20 @@ CREATE TABLE IF NOT EXISTS backtest_results (
 );
 
 -- ---------------------------------------------------------------------------
+-- backtest_analytics: pre-computed chart data for backtest visualisation (Phase 4.9)
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS backtest_analytics (
+    id              SERIAL PRIMARY KEY,
+    backtest_id     INTEGER          NOT NULL REFERENCES backtest_results(id) ON DELETE CASCADE,
+    equity_curve    JSONB,           -- Array of daily portfolio values
+    drawdown_curve  JSONB,           -- Array of daily drawdown percentages
+    monthly_returns JSONB,           -- Nested: Year -> Month -> return value
+    regime_stats    JSONB,           -- Nested: Strategy -> Regime -> net PnL
+    timestamps      JSONB,           -- Array of ISO date strings (aligns with curves)
+    UNIQUE(backtest_id)
+);
+
+-- ---------------------------------------------------------------------------
 -- vix_data: daily VIX close prices for volatility regime filtering (Phase 4.5)
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS vix_data (

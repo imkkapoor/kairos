@@ -236,7 +236,7 @@ CONFIGS: dict[str, dict] = {
         "max_sector_exposure": 0.30,
         "use_vol_filter":      True,
         "vroc_window":         10,
-        "vroc_threshold":      0.20,
+        "vroc_threshold":      0.50,
     },
 
     # Phase 4.7: vol_vroc_adaptive + hard circuit breaker (15% trigger)
@@ -263,7 +263,7 @@ CONFIGS: dict[str, dict] = {
         "max_sector_exposure":  0.30,
         "use_vol_filter":       True,
         "vroc_window":          10,
-        "vroc_threshold":       0.20,
+        "vroc_threshold":       0.50,
         "use_circuit_breaker":  True,
         "dd_trigger":           0.15,
         "dd_reset":             0.10,
@@ -293,7 +293,7 @@ CONFIGS: dict[str, dict] = {
         "max_sector_exposure":  0.30,
         "use_vol_filter":       True,
         "vroc_window":          10,
-        "vroc_threshold":       0.20,
+        "vroc_threshold":       0.50,
         "use_circuit_breaker":  True,
         "dd_trigger":           0.10,
         "dd_reset":             0.07,
@@ -323,7 +323,7 @@ CONFIGS: dict[str, dict] = {
         "max_sector_exposure":   0.30,
         "use_vol_filter":        True,
         "vroc_window":           10,
-        "vroc_threshold":        0.20,
+        "vroc_threshold":        0.50,
         "use_soft_cb":           True,
         "cb_soft_start":         0.05,
         "cb_hard_stop":          0.12,
@@ -356,7 +356,7 @@ CONFIGS: dict[str, dict] = {
         "max_sector_exposure":   0.30,
         "use_vol_filter":        True,
         "vroc_window":           10,
-        "vroc_threshold":        0.20,
+        "vroc_threshold":        0.50,
         "use_soft_cb":           True,
         "cb_soft_start":         0.05,
         "cb_hard_stop":          0.12,
@@ -389,5 +389,106 @@ CONFIGS: dict[str, dict] = {
         "crisis_max_positions": 6,
         "vroc_threshold": 0.15,
         "min_dollar_risk": 500          
+    },
+
+    # Phase 4.10: multi-trigger recovery — soft CB + dynamic floor + penalty box
+    "vol_recovery_v1": {
+        "strategy_weights": {
+            "rsi":             1.0,
+            "momentum":        1.0,
+            "macd":            0.8,
+            "reversal":        0.6,
+            "sector_rotation": 0.5,
+        },
+        "regime_overrides": {
+            "trending": {
+                "momentum": 1.3,
+                "rsi":      0.3,
+            },
+            "choppy": {
+                "rsi":      1.3,
+                "momentum": 0.2,
+            },
+            "crisis": {
+                "reversal":        1.5,
+                "rsi":             0.5,
+                "sector_rotation": 0.3,
+                "macd":            0.1,
+                "momentum":        0.1,
+            },
+        },
+        "min_strength":            0.10,
+        "max_open_positions":      20,
+        "max_sector_exposure":     0.30,
+        "use_vol_filter":          True,
+        "vroc_window":             10,
+        "vroc_threshold":          0.50,
+        "use_soft_cb":             True,
+        "cb_soft_start":           0.05,
+        "cb_hard_stop":            0.12,
+        "cb_min_mult":             0.25,
+        "use_crisis_pos_limits":   True,
+        "crisis_max_positions":    8,
+        "min_dollar_risk":         500,
+        # Phase 4.10: multi-trigger recovery params
+        "cooldown_period":         21,     # 21 trading-day penalty box
+        "vix_recovery_threshold":  25.0,   # VIX must be < 25
+        "vix_recovery_days":       3,      # sustained for 3 consecutive days
+        "dd_reset_threshold":      0.03,   # drawdown < 3% resets CB
+    },
+    
+    "chatgpt_adaptive_recovery": {
+        "strategy_weights": {
+            "rsi":             0.9,
+            "momentum":        1.2,
+            "macd":            1.0,
+            "reversal":        0.5,
+            "sector_rotation": 0.7
+        },
+
+        "regime_overrides": {
+            "trending": {
+                "momentum": 1.5,
+                "macd":     1.2,
+                "rsi":      0.4,
+                "reversal": 0.2
+            },
+            "choppy": {
+                "rsi":      1.4,
+                "reversal": 1.0,
+                "momentum": 0.4,
+                "macd":     0.6
+            },
+            "crisis": {
+                "reversal":        1.2,
+                "rsi":             0.8,
+                "momentum":        0.5,
+                "macd":            0.4,
+                "sector_rotation": 0.2
+            }
+        },
+
+        "min_strength":            0.12,
+        "max_open_positions":      16,
+        "max_sector_exposure":     0.25,
+
+        "use_vol_filter":          True,
+        "vroc_window":             8,
+        "vroc_threshold":          0.45,
+
+        "use_soft_cb":             True,
+        "cb_soft_start":           0.04,
+        "cb_hard_stop":            0.10,
+        "cb_min_mult":             0.35,
+
+        "use_crisis_pos_limits":   True,
+        "crisis_max_positions":    6,
+
+        "min_dollar_risk":         600,
+
+        "cooldown_period":         14,
+        "vix_recovery_threshold":  22.0,
+        "vix_recovery_days":       2,
+        "dd_reset_threshold":      0.02
     }
 }

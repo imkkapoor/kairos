@@ -312,7 +312,7 @@ def run_window(
     # Phase 4.5: vol filter state
     use_vol = config.get("use_vol_filter", False)
     vroc_window    = config.get("vroc_window",    10)
-    vroc_threshold = config.get("vroc_threshold", 0.20)
+    vroc_threshold = config.get("vroc_threshold", 0.50)
     vix_day_values: list[float] = []
     elevated_day_count: int = 0
     spike_day_count: int = 0
@@ -342,34 +342,58 @@ def run_window(
     cb_mult_values:      list  = []
     chatter_held_days:   int   = 0
 
+    # Phase 4.10: multi-trigger recovery — "whichever comes first" CB reset
+    cooldown_period        = config.get("cooldown_period", 21)          # trading days
+    vix_recovery_threshold = config.get("vix_recovery_threshold", 25.0) # VIX level
+    vix_recovery_days      = config.get("vix_recovery_days", 3)         # consecutive days
+    dd_reset_threshold     = config.get("dd_reset_threshold", 0.03)     # drawdown pct
+    cb_trip_day_index: int | None = None       # trading-day index when soft CB tripped
+    vix_below_count:   int       = 0           # consecutive days VIX < threshold (soft CB)
+    recovery_trigger_count: int  = 0           # how many times recovery fired
+
+    # Phase 4.10: hard CB (binary) recovery tracking — separate state from soft CB
+    # hard_cb_trip_day_index: -1 = not yet tripped / just recovered; ≥0 = trip day index
+    hard_cb_trip_day_index: int = -1
+    hard_vix_below_count:   int = 0
+
     # Phase 4.8: crisis position limits — restrict new BUYs in HIGH/EXTREME (Change 3)
     use_crisis_pos_limits = config.get("use_crisis_pos_limits", False)
     crisis_max_positions  = config.get("crisis_max_positions",  8)
 
     # Phase 4.8: minimum dollar risk floor (Change 4)
+    # Phase 4.10: dynamic floor scales with cb_mult
     min_dollar_risk_cfg  = config.get("min_dollar_risk", 0)
     signals_below_floor: int = 0
     total_buy_attempts:  int = 0
 
+    # Silent-killer counters: track why trades were skipped
+    skipped_vroc:     int = 0
+    skipped_min_risk: int = 0
+
     # Phase 4.8: daily effective_mult tracking for allocation chart
     effective_mult_by_day: list = []
 
-    # Build sorted list of trading days within test window using SPY as calendar
-    ref_ticker = "SPY" if "SPY" in ohlcv else next(iter(ohlcv), None)
-    if ref_ticker is None:
+    # Build union calendar: iterate all days where at least one market is open.
+    # This ensures Canadian-holiday / US-holiday gaps don't skip valuation days.
+    if not ohlcv:
         return _empty_metrics(test_start, test_end)
 
     test_start_ts = pd.Timestamp(test_start, tz="UTC")
     test_end_ts   = pd.Timestamp(test_end, tz="UTC")
-    ref_df        = ohlcv[ref_ticker]
-    trading_days  = ref_df.index[
-        (ref_df.index >= test_start_ts) & (ref_df.index < test_end_ts)
-    ].tolist()
+    all_day_set: set[pd.Timestamp] = set()
+    for df in ohlcv.values():
+        mask = (df.index >= test_start_ts) & (df.index < test_end_ts)
+        all_day_set.update(df.index[mask].tolist())
+    trading_days = sorted(all_day_set)
 
     if not trading_days:
         return _empty_metrics(test_start, test_end)
 
     all_tickers = list(ohlcv.keys())
+
+    # Price forward-filling state: on days a ticker's exchange is closed,
+    # carry forward the last known close to avoid $0 valuation (holiday gap fix).
+    last_known_close: dict[str, float] = {}
 
     # Rolling indicator cache: replicates live scanner timing.
     # The live scanner runs at 17:15 ET on day T using T's close data,
@@ -384,10 +408,23 @@ def run_window(
         # ── 1. Prices for today ──────────────────────────────────────────
         open_prices:  dict[str, float] = {}
         close_prices: dict[str, float] = {}
+        trading_today: set[str] = set()   # tickers whose exchange is actually open
         for ticker, df in ohlcv.items():
             if day_ts in df.index:
                 open_prices[ticker]  = float(df.at[day_ts, "Open"])
                 close_prices[ticker] = float(df.at[day_ts, "Close"])
+                trading_today.add(ticker)
+
+        # Forward-fill: carry last known close for tickers not trading today.
+        # This prevents positions on closed exchanges from being valued at $0.
+        for ticker, last_px in last_known_close.items():
+            if ticker not in trading_today:
+                close_prices[ticker] = last_px
+                open_prices[ticker]  = last_px   # best estimate for valuation
+        # Update last known close with today's actual closes
+        for t, p in close_prices.items():
+            if t in trading_today and p > 0:
+                last_known_close[t] = p
 
         # ── 2. FX rate for today ─────────────────────────────────────────
         if fx_rates is not None:
@@ -452,8 +489,12 @@ def run_window(
             sector_scores = None
 
         # ── 8. Stop-loss / take-profit exits (at Open) ───────────────────
+        # Only check SL/TP for tickers whose exchange is actually open today;
+        # forward-filled (stale) prices must not trigger exits.
         to_exit: list[tuple[str, float, str]] = []
         for ticker, pos in list(portfolio.positions.items()):
+            if ticker not in trading_today:
+                continue
             op = open_prices.get(ticker)
             if op is None:
                 continue
@@ -463,20 +504,60 @@ def run_window(
                 to_exit.append((ticker, op, "take_profit"))
 
         for ticker, exit_px, exit_type in to_exit:
-            cost_usd = portfolio.positions[ticker]["qty"] * portfolio.positions[ticker]["avg_cost_usd"]
+            pos = portfolio.positions[ticker]
+            cost_usd = pos["qty"] * pos["avg_cost_usd"]
+            _strategy = pos.get("strategy", "unknown")
+            _regime = regimes.get(ticker, {}).get("regime", "UNKNOWN").lower()
             pnl = portfolio.close_position(ticker, exit_px, fx_today)
             pnl_pct = pnl / cost_usd if cost_usd > 0 else 0.0
-            trade_log.append({"ticker": ticker, "pnl_usd": pnl, "pnl_pct": pnl_pct, "exit_type": exit_type})
+            trade_log.append({"ticker": ticker, "pnl_usd": pnl, "pnl_pct": pnl_pct, "exit_type": exit_type, "strategy": _strategy, "regime": _regime})
 
         # ── 8a. Circuit breaker state update (after exits, before new buys) ─
         if use_circuit_breaker:
-            cb_val = portfolio.get_total_value(open_prices, fx_today)
-            current_dd = (cb_peak_value - cb_val) / cb_peak_value if cb_peak_value > 0 else 0.0
-            cb_peak_value = max(cb_peak_value, cb_val)
-            if current_dd >= dd_trigger:
-                circuit_breaker_active = True
-            elif current_dd < dd_reset:
+            cb_val   = portfolio.get_total_value(open_prices, fx_today)
+            _day_idx = trading_days.index(day_ts)
+
+            # Phase 4.10: VIX lookup for hard-CB time/market recovery
+            # Use 3-day trailing average to smooth single-day VIX flickers.
+            _hard_vix = None
+            if vix_series is not None and not vix_series.empty:
+                _vix_ts = pd.Timestamp(day_date, tz="UTC")
+                _prior_vix = vix_series[vix_series.index <= _vix_ts]
+                if not _prior_vix.empty:
+                    _hard_vix = float(_prior_vix.iloc[-3:].mean())
+
+            if _hard_vix is not None and _hard_vix < vix_recovery_threshold:
+                hard_vix_below_count += 1
+            else:
+                hard_vix_below_count = 0
+
+            # Check multi-trigger recovery BEFORE applying dd logic for today
+            _hard_recovery = False
+            if circuit_breaker_active:
+                # Condition 1: Time — penalty box expired since first trip
+                if (hard_cb_trip_day_index >= 0 and
+                        (_day_idx - hard_cb_trip_day_index) >= cooldown_period):
+                    _hard_recovery = True
+                # Condition 2: Market — VIX sustained below threshold
+                if hard_vix_below_count >= vix_recovery_days:
+                    _hard_recovery = True
+
+            if _hard_recovery:
+                cb_peak_value          = cb_val   # ATH reset: drawdown now measured from recovery equity
                 circuit_breaker_active = False
+                hard_cb_trip_day_index = -1       # sentinel cleared; refreshed on next trip
+                hard_vix_below_count   = 0
+            else:
+                current_dd    = (cb_peak_value - cb_val) / cb_peak_value if cb_peak_value > 0 else 0.0
+                cb_peak_value = max(cb_peak_value, cb_val)
+                if current_dd >= dd_trigger:
+                    if not circuit_breaker_active:  # record the first day of this trip only
+                        hard_cb_trip_day_index = _day_idx
+                    circuit_breaker_active = True
+                elif current_dd < dd_reset:
+                    circuit_breaker_active = False
+                    hard_cb_trip_day_index = -1     # organic dd recovery; reset sentinel
+
             if circuit_breaker_active:
                 breaker_active_day_count += 1
         circuit_breaker_days.append(circuit_breaker_active)
@@ -513,7 +594,7 @@ def run_window(
                 )
                 vix_regime_today = _scb_state.get("regime", "NORMAL")
 
-        # ── 9b. Soft CB state update (Change 1 + 2) ────────────────────────
+        # ── 9b. Soft CB state update (Change 1 + 2 + Phase 4.10 recovery) ──
         if use_soft_cb:
             _scb_val   = portfolio.get_total_value(open_prices, fx_today)
             _current_dd = (soft_cb_peak_value - _scb_val) / soft_cb_peak_value if soft_cb_peak_value > 0 else 0.0
@@ -530,7 +611,51 @@ def run_window(
             _rec_days_map = {"NORMAL": 3, "ELEVATED": 5, "HIGH": 8, "EXTREME": 12}
             _vix_rec_days = _rec_days_map.get(vix_regime_today, 3)
 
-            if _current_dd < cb_soft_start:
+            # ── Phase 4.10: Multi-trigger recovery ("whichever comes first") ──
+            # Track VIX consecutive days below threshold for market-condition trigger.
+            # Use 3-day trailing average to smooth single-day VIX flickers.
+            _today_vix = None
+            if vix_series is not None and not vix_series.empty:
+                _vix_ts = pd.Timestamp(day_date, tz="UTC")
+                _prior = vix_series[vix_series.index <= _vix_ts]
+                if not _prior.empty:
+                    _today_vix = float(_prior.iloc[-3:].mean())
+
+            if _today_vix is not None and _today_vix < vix_recovery_threshold:
+                vix_below_count += 1
+            else:
+                vix_below_count = 0
+
+            # Record the day index when CB first tripped (cb_mult < 1.0)
+            _day_idx = trading_days.index(day_ts)
+            if soft_cb_was_active and cb_trip_day_index is None:
+                cb_trip_day_index = _day_idx
+
+            # Check the three recovery conditions (any one resets the CB)
+            _recovery_fired = False
+            if soft_cb_was_active:
+                # Condition 1: Market — VIX sustained below threshold
+                if vix_below_count >= vix_recovery_days:
+                    _recovery_fired = True
+                # Condition 2: Time — penalty box expired
+                if cb_trip_day_index is not None and (_day_idx - cb_trip_day_index) >= cooldown_period:
+                    _recovery_fired = True
+                # Condition 3: Equity — drawdown recovered below reset threshold
+                if _current_dd < dd_reset_threshold:
+                    _recovery_fired = True
+
+            if _recovery_fired:
+                # Full reset: CB releases, ATH resets to current equity
+                # so drawdown is measured from recovery level (fixes Re-Trip Trap)
+                cb_mult = 1.0
+                soft_cb_peak_value = _scb_val
+                soft_cb_was_active = False
+                cb_trip_day_index  = None
+                vix_below_count    = 0
+                soft_peak_dd       = 0.0
+                days_since_peak_dd = 0
+                recovery_trigger_count += 1
+            elif _current_dd < cb_soft_start:
                 if soft_cb_was_active and days_since_peak_dd < _vix_rec_days:
                     # Chatter prevention: hold at last linear value, don't release yet
                     cb_mult = last_cb_mult
@@ -598,9 +723,12 @@ def run_window(
 
         # ── 11a. Apply vol suppression (zeroes strength → drops at min_strength) ─
         if suppressed_strategies:
+            _spike_active = use_vol and vol_state.get("spike_triggered", False)
+            _vroc_ratio   = vol_state.get("vroc_ratio", 0.0) if use_vol else 0.0
             for sig in buy_signals:
                 if sig.get("strategy") in suppressed_strategies:
                     sig["strength"] = 0.0
+                    skipped_vroc += 1
 
         # ── 12. Filter by min strength ────────────────────────────────────
         buy_signals = [s for s in buy_signals if s["strength"] >= min_strength]
@@ -626,6 +754,9 @@ def run_window(
             if tkr in just_opened or tkr in portfolio.positions:
                 continue
 
+            # Only open positions on tickers whose exchange is open today
+            if tkr not in trading_today:
+                continue
             fill_price = open_prices.get(tkr)
             if fill_price is None or fill_price <= 0:
                 continue
@@ -656,8 +787,11 @@ def run_window(
                 continue  # hard stop: no new BUYs (soft CB or binary CB)
             dollar_risk = strength * portfolio.max_portfolio_risk * total_val * effective_mult
             total_buy_attempts += 1
-            if dollar_risk < min_dollar_risk_cfg:
+            # Phase 4.10: dynamic risk floor scales with CB multiplier
+            effective_min_risk = min_dollar_risk_cfg * max(effective_mult, 0.01)
+            if dollar_risk < effective_min_risk:
                 signals_below_floor += 1
+                skipped_min_risk += 1
                 continue
             qty = floor(dollar_risk / risk_per_usd)
             if qty < 1:
@@ -722,14 +856,20 @@ def run_window(
         last_day_ts = trading_days[-1]
         last_close  = {t: float(df.at[last_day_ts, "Close"])
                        for t, df in ohlcv.items() if last_day_ts in df.index}
+        # Use forward-filled prices for tickers whose exchange was closed on the last day
+        for t, p in last_known_close.items():
+            if t not in last_close:
+                last_close[t] = p
         final_fx = float(fx_rates.iloc[-1]) if fx_rates is not None else 1.0
         for ticker in list(portfolio.positions.keys()):
             ep = last_close.get(ticker, 0.0)
             if ep > 0:
-                cost_usd = portfolio.positions[ticker]["qty"] * portfolio.positions[ticker]["avg_cost_usd"]
+                pos = portfolio.positions[ticker]
+                cost_usd = pos["qty"] * pos["avg_cost_usd"]
+                _strategy = pos.get("strategy", "unknown")
                 pnl = portfolio.close_position(ticker, ep, final_fx)
                 pnl_pct = pnl / cost_usd if cost_usd > 0 else 0.0
-                trade_log.append({"ticker": ticker, "pnl_usd": pnl, "pnl_pct": pnl_pct, "exit_type": "end_of_window"})
+                trade_log.append({"ticker": ticker, "pnl_usd": pnl, "pnl_pct": pnl_pct, "exit_type": "end_of_window", "strategy": _strategy, "regime": "unknown"})
 
     metrics = _compute_metrics(trade_log, equity_curve, test_start, test_end, portfolio.initial_capital)
 
@@ -774,6 +914,18 @@ def run_window(
         signals_below_floor / total_buy_attempts if total_buy_attempts > 0 else None
     )
     metrics["effective_mult_by_day"]  = effective_mult_by_day  # per-day, not persisted to DB
+    metrics["skipped_vroc"]            = skipped_vroc
+    metrics["skipped_min_risk"]        = skipped_min_risk
+
+    # Phase 4.10: multi-trigger recovery metrics
+    metrics["cooldown_period"]         = cooldown_period if use_soft_cb else None
+    metrics["vix_recovery_threshold"]  = vix_recovery_threshold if use_soft_cb else None
+    metrics["vix_recovery_days"]       = vix_recovery_days if use_soft_cb else None
+    metrics["dd_reset_threshold"]      = dd_reset_threshold if use_soft_cb else None
+    metrics["recovery_trigger_count"]  = recovery_trigger_count if use_soft_cb else None
+
+    # Phase 4.9: trade log with strategy+regime for analytics computation
+    metrics["trade_log"] = trade_log
 
     return metrics
 
@@ -824,6 +976,14 @@ def _empty_metrics(test_start: date, test_end: date) -> dict:
         "min_dollar_risk":         0,
         "pct_signals_below_floor": None,
         "effective_mult_by_day":   [],
+        "skipped_vroc":            0,
+        "skipped_min_risk":        0,
+        # Phase 4.10 multi-trigger recovery fields
+        "cooldown_period":         None,
+        "vix_recovery_threshold":  None,
+        "vix_recovery_days":       None,
+        "dd_reset_threshold":      None,
+        "recovery_trigger_count":  None,
     }
 
 
@@ -908,6 +1068,106 @@ def _compute_metrics(
 
 
 # ---------------------------------------------------------------------------
+# Analytics computation (Phase 4.9)
+# ---------------------------------------------------------------------------
+
+def compute_analytics(metrics: dict) -> dict:
+    """Build chart-ready analytics from a run_window() result dict.
+
+    Returns dict with keys: equity_curve, drawdown_curve, monthly_returns,
+    regime_stats, timestamps.
+    """
+    ec = metrics.get("equity_curve", [])
+    trade_log = metrics.get("trade_log", [])
+
+    if not ec:
+        return {
+            "equity_curve": [],
+            "drawdown_curve": [],
+            "monthly_returns": {},
+            "regime_stats": {},
+            "timestamps": [],
+        }
+
+    # --- Timestamps & equity values ---
+    timestamps = [d.isoformat() if hasattr(d, "isoformat") else str(d) for d, _ in ec]
+    values = [float(v) for _, v in ec]
+
+    # --- Drawdown curve ---
+    peak = values[0]
+    drawdown_curve = []
+    for v in values:
+        if v > peak:
+            peak = v
+        dd = (peak - v) / peak if peak > 0 else 0.0
+        drawdown_curve.append(round(-dd, 6))
+
+    # --- Monthly returns ---
+    _MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+               "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+    monthly_returns: dict[str, dict] = {}
+    if len(ec) >= 2:
+        # Group equity values by (year, month) → first and last value
+        from collections import OrderedDict
+        month_buckets: dict[tuple[int, int], list[tuple]] = OrderedDict()
+        for d, v in ec:
+            if hasattr(d, "year"):
+                yr, mo = d.year, d.month
+            else:
+                # ISO string fallback
+                parts = str(d).split("-")
+                yr, mo = int(parts[0]), int(parts[1])
+            key = (yr, mo)
+            if key not in month_buckets:
+                month_buckets[key] = []
+            month_buckets[key].append(float(v))
+
+        # Convert to monthly returns: (last_val / first_val) - 1
+        prev_end_val = None
+        for (yr, mo), vals in month_buckets.items():
+            yr_str = str(yr)
+            if yr_str not in monthly_returns:
+                monthly_returns[yr_str] = {}
+            start_val = prev_end_val if prev_end_val is not None else vals[0]
+            end_val = vals[-1]
+            ret = (end_val / start_val - 1) if start_val > 0 else 0.0
+            monthly_returns[yr_str][_MONTHS[mo - 1]] = round(ret, 4)
+            prev_end_val = end_val
+
+        # Add annual return per year
+        for yr_str, months in monthly_returns.items():
+            annual = 1.0
+            for m in _MONTHS:
+                if m in months:
+                    annual *= (1 + months[m])
+            monthly_returns[yr_str]["annual"] = round(annual - 1, 4)
+
+    # --- Regime stats: strategy → regime → net PnL ---
+    regime_stats: dict[str, dict[str, float]] = {}
+    for t in trade_log:
+        strat = t.get("strategy", "unknown")
+        regime = t.get("regime", "unknown")
+        pnl = float(t.get("pnl_usd", 0))
+        if strat not in regime_stats:
+            regime_stats[strat] = {}
+        regime_stats[strat][regime] = regime_stats[strat].get(regime, 0.0) + pnl
+
+    # Round regime_stats values
+    for strat in regime_stats:
+        for reg in regime_stats[strat]:
+            regime_stats[strat][reg] = round(regime_stats[strat][reg], 2)
+
+    return {
+        "equity_curve": [round(v, 2) for v in values],
+        "drawdown_curve": drawdown_curve,
+        "monthly_returns": monthly_returns,
+        "regime_stats": regime_stats,
+        "timestamps": timestamps,
+    }
+
+
+# ---------------------------------------------------------------------------
 # ROOS orchestrator
 # ---------------------------------------------------------------------------
 
@@ -920,6 +1180,7 @@ def run_roos(
     progress_prefix: str = "",
     capital_mode: str = "capital_refresh",
     preloaded_data: dict | None = None,
+    quiet: bool = False,
 ) -> list[dict]:
     """Run all ROOS windows for one allocation config.
 
@@ -964,7 +1225,7 @@ def run_roos(
         fx_rates_all   = preloaded_data["fx_rates"]
         vix_all        = preloaded_data.get("vix")
     else:
-        if _rich:
+        if _rich and not quiet:
             out = Console()
             out.print(f"  [cyan]Loading data ({all_start} → {all_end})…[/cyan]")
 
@@ -987,7 +1248,7 @@ def run_roos(
         test_start = windows[0]["test_start"]
         test_end   = windows[-1]["test_end"]
 
-        if _rich:
+        if _rich and not quiet:
             out = Console()
             out.print(f"  {progress_prefix}[bold]{config_name}[/bold]  {test_start} → {test_end} (compounded)")
 
@@ -1038,7 +1299,7 @@ def run_roos(
             MofNCompleteColumn(),
             TimeElapsedColumn(),
         )
-        if _rich else None
+        if (_rich and not quiet) else None
     )
     _task_id = _progress_ctx.add_task(config_name, total=n_windows) if _progress_ctx else None
     if _progress_ctx:
@@ -1108,7 +1369,7 @@ def run_all_configs(
 
     Returns a summary DataFrame.
     """
-    from db.connection import insert_backtest_result, get_backtest_summary
+    from db.connection import insert_backtest_result, insert_backtest_analytics, get_backtest_summary
     import os
     import uuid
 
@@ -1133,9 +1394,11 @@ def run_all_configs(
         # Persist each window result — each config gets its own run_id
         run_id = str(uuid.uuid4())
         for res in window_results:
-            db_row = {k: v for k, v in res.items() if k != "equity_curve"}
+            db_row = {k: v for k, v in res.items() if k not in ("equity_curve", "circuit_breaker_days", "effective_mult_by_day", "trade_log")}
             db_row["currency"] = currency
             db_row["run_id"]   = run_id
-            insert_backtest_result(db_row)
+            bt_id = insert_backtest_result(db_row)
+            analytics = compute_analytics(res)
+            insert_backtest_analytics(bt_id, analytics)
 
     return get_backtest_summary()
