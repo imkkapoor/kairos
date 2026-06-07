@@ -83,11 +83,12 @@ class BacktestPortfolio:
     """In-memory paper portfolio for backtesting. All values in USD.
 
     Positions dict structure per ticker:
-        {qty, avg_cost_usd, stop_loss, take_profit, strategy, sector, is_cad}
+        {qty, avg_cost_usd, stop_loss, take_profit, strategy, sector, is_cad, opened_date}
 
     avg_cost_usd: cost per share expressed in USD at the time of opening.
     stop_loss / take_profit are stored in the ticker's native currency
     (same as Phase 3 executor — comparison happens against native Open price).
+    opened_date: date object for time-based exit tracking.
     """
 
     def __init__(
@@ -125,6 +126,7 @@ class BacktestPortfolio:
         strategy: str,
         sector: str,
         fx_rate: float,        # native → USD (1.0 for US stocks)
+        opened_date=None,      # date object for time-based exit tracking
     ) -> None:
         is_cad = ticker.endswith(".TO")
         cost_native = qty * price
@@ -139,6 +141,7 @@ class BacktestPortfolio:
             "strategy":     strategy,
             "sector":       sector,
             "is_cad":       is_cad,
+            "opened_date":  opened_date,
         }
 
     def close_position(
@@ -304,6 +307,7 @@ def run_window(
     portfolio = BacktestPortfolio(initial_capital=_capital)
     trade_log: list[dict] = []   # {ticker, pnl_usd, pct, exit_type, cost_usd}
     equity_curve: list[tuple[date, float]] = []
+    daily_snapshots: list[dict] = []  # {date, positions, cash, total_value, total_pnl}
 
     max_open_positions  = config.get("max_open_positions",  20)
     max_sector_exposure = config.get("max_sector_exposure", 0.30)
@@ -704,7 +708,15 @@ def run_window(
         all_signals.extend(sector_rotation_strategy.generate_signals(
             all_tickers, scan_ind, regimes, open_tickers, sector_scores, sector_map))
 
-        # Keep only BUY signals (SELL exits handled by stop/TP above)
+        # Build a sell-signal lookup for reversal exit checks (step 13b)
+        sell_signals_today: dict[str, dict] = {}
+        for _sig in all_signals:
+            if str(_sig.get("signal_type", "")).upper() == "SELL":
+                _st = _sig.get("ticker", "")
+                if _st:
+                    sell_signals_today[_st] = _sig
+
+        # Keep only BUY signals for the buy loop
         buy_signals = [s for s in all_signals if str(s.get("signal_type", "")).upper() == "BUY"]
 
         # ── 11. Apply config weights + regime overrides ───────────────────
@@ -743,6 +755,67 @@ def run_window(
         # ── 13a. Circuit breaker: suppress all BUY signals ───────────────
         if use_circuit_breaker and circuit_breaker_active:
             buy_signals = []
+
+        # ── 13b. Signal reversal exits ────────────────────────────────────
+        # Mirror position_manager.py exits 4 (RSI reversal + momentum death cross).
+        # Detected from T-1 indicators (scan_ind); exits at today's Open price.
+        for ticker, pos in list(portfolio.positions.items()):
+            if ticker not in trading_today:
+                continue
+            exit_px = open_prices.get(ticker)
+            if exit_px is None:
+                continue
+            _strat   = pos.get("strategy", "")
+            _exited  = False
+
+            # RSI reversal: sell signal with strength > 0.5
+            if _strat == "rsi" and ticker in sell_signals_today:
+                sig_strength = float(sell_signals_today[ticker].get("strength", 0.0))
+                if sig_strength > 0.5:
+                    cost_usd = pos["qty"] * pos["avg_cost_usd"]
+                    _regime  = regimes.get(ticker, {}).get("regime", "UNKNOWN").lower()
+                    pnl = portfolio.close_position(ticker, exit_px, fx_today)
+                    trade_log.append({"ticker": ticker, "pnl_usd": pnl,
+                                      "pnl_pct": pnl / cost_usd if cost_usd > 0 else 0.0,
+                                      "exit_type": "signal_reversal", "strategy": _strat, "regime": _regime})
+                    _exited = True
+
+            # Momentum death cross: ma_50 < ma_200 in T-1 indicators
+            if not _exited and _strat == "momentum":
+                _ind   = scan_ind.get(ticker, {})
+                ma_50  = _ind.get("ma_50")
+                ma_200 = _ind.get("ma_200")
+                if ma_50 is not None and ma_200 is not None and float(ma_50) < float(ma_200):
+                    cost_usd = pos["qty"] * pos["avg_cost_usd"]
+                    _regime  = regimes.get(ticker, {}).get("regime", "UNKNOWN").lower()
+                    pnl = portfolio.close_position(ticker, exit_px, fx_today)
+                    trade_log.append({"ticker": ticker, "pnl_usd": pnl,
+                                      "pnl_pct": pnl / cost_usd if cost_usd > 0 else 0.0,
+                                      "exit_type": "signal_reversal", "strategy": _strat, "regime": _regime})
+
+        # ── 13c. Time-based exits (> 30 days open, negative P&L) ─────────
+        # Mirror position_manager.py exit 5. Exit at today's Open price.
+        for ticker, pos in list(portfolio.positions.items()):
+            if ticker not in trading_today:
+                continue
+            opened = pos.get("opened_date")
+            if opened is None:
+                continue
+            if (day_date - opened).days <= 30:
+                continue
+            exit_px = open_prices.get(ticker)
+            if exit_px is None:
+                continue
+            # Compute P&L in native currency to match live system's pnl < 0 check
+            avg_native = pos["avg_cost_usd"] / (fx_today if pos["is_cad"] else 1.0)
+            if (exit_px - avg_native) * pos["qty"] < 0:
+                cost_usd = pos["qty"] * pos["avg_cost_usd"]
+                _regime  = regimes.get(ticker, {}).get("regime", "UNKNOWN").lower()
+                _strat   = pos.get("strategy", "unknown")
+                pnl = portfolio.close_position(ticker, exit_px, fx_today)
+                trade_log.append({"ticker": ticker, "pnl_usd": pnl,
+                                  "pnl_pct": pnl / cost_usd if cost_usd > 0 else 0.0,
+                                  "exit_type": "time_exit", "strategy": _strat, "regime": _regime})
 
         # ── 14. Execute trades ────────────────────────────────────────────
         just_opened: set[str] = set()
@@ -835,14 +908,60 @@ def run_window(
             portfolio.open_position(
                 tkr, qty, fill_price, stop_loss, take_profit,
                 strategy_name, sector, fx_today,
+                opened_date=day_date,
             )
             just_opened.add(tkr)
 
-        # ── 15. Record equity curve ───────────────────────────────────────
+        # ── 15. Record equity curve + daily snapshot ────────────────────
+        # ── 15b. Trailing stop ratchet ────────────────────────────────────
+        # Mirror position_manager.py exit 3. Uses today's Close price and ATR.
+        # Updated stop will be checked against NEXT day's Open (step 8).
+        for ticker, pos in portfolio.positions.items():
+            if ticker not in trading_today:
+                continue
+            close_px = close_prices.get(ticker)
+            if close_px is None:
+                continue
+            avg_native = pos["avg_cost_usd"] / (fx_today if pos["is_cad"] else 1.0)
+            if close_px <= avg_native * 1.05:
+                continue  # need >5% profit before ratcheting
+            atr = today_ind.get(ticker, {}).get("atr_14")
+            if not atr:
+                continue
+            try:
+                atr = float(atr)
+            except (TypeError, ValueError):
+                continue
+            if atr == 0:
+                continue
+            new_stop = close_px - portfolio.atr_multiplier * atr
+            if new_stop > pos["stop_loss"]:
+                portfolio.positions[ticker]["stop_loss"] = new_stop
+
         total_val = portfolio.get_total_value(close_prices, fx_today)
         if total_val > portfolio.peak_value:
             portfolio.peak_value = total_val
         equity_curve.append((day_date, total_val))
+
+        # Snapshot: positions held, cash, total value, total P&L
+        snap_positions = {}
+        for _t, _p in portfolio.positions.items():
+            _px = close_prices.get(_t, 0.0)
+            _mv = _p["qty"] * _px * (fx_today if _p["is_cad"] else 1.0)
+            snap_positions[_t] = {
+                "qty": _p["qty"],
+                "avg_cost_usd": round(_p["avg_cost_usd"], 2),
+                "market_value_usd": round(_mv, 2),
+                "strategy": _p["strategy"],
+                "sector": _p["sector"],
+            }
+        daily_snapshots.append({
+            "date": day_date.isoformat(),
+            "positions": snap_positions,
+            "cash": round(portfolio.cash, 2),
+            "total_value": round(total_val, 2),
+            "total_pnl": round(total_val - portfolio.initial_capital, 2),
+        })
 
         # ── 16. Advance rolling indicator cache for next iteration ────────
         # _scan_ind becomes the indicators from today's close; on the next
@@ -926,6 +1045,9 @@ def run_window(
 
     # Phase 4.9: trade log with strategy+regime for analytics computation
     metrics["trade_log"] = trade_log
+
+    # Daily portfolio snapshots for analytics
+    metrics["daily_snapshots"] = daily_snapshots
 
     return metrics
 
@@ -1164,6 +1286,7 @@ def compute_analytics(metrics: dict) -> dict:
         "monthly_returns": monthly_returns,
         "regime_stats": regime_stats,
         "timestamps": timestamps,
+        "daily_snapshots": metrics.get("daily_snapshots", []),
     }
 
 
@@ -1394,7 +1517,7 @@ def run_all_configs(
         # Persist each window result — each config gets its own run_id
         run_id = str(uuid.uuid4())
         for res in window_results:
-            db_row = {k: v for k, v in res.items() if k not in ("equity_curve", "circuit_breaker_days", "effective_mult_by_day", "trade_log")}
+            db_row = {k: v for k, v in res.items() if k not in ("equity_curve", "circuit_breaker_days", "effective_mult_by_day", "trade_log", "daily_snapshots")}
             db_row["currency"] = currency
             db_row["run_id"]   = run_id
             bt_id = insert_backtest_result(db_row)

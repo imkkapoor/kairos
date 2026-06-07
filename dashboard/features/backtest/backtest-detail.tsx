@@ -3,7 +3,7 @@
 import { useState, useMemo } from "react";
 import Link from "next/link";
 import { ArrowLeft, ChevronDown, ChevronRight } from "lucide-react";
-import { useBacktest, useBacktestAnalytics } from "@/lib/api/queries";
+import { useBacktest, useBacktestAnalytics, useBacktestVix } from "@/lib/api/queries";
 import { DataTable } from "@/components/ui/data-table";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { backtestColumns } from "./columns";
@@ -368,6 +368,8 @@ export function BacktestDetail({ runId }: BacktestDetailProps) {
   const firstRun = data?.runs[0];
   const isCompounded = firstRun?.capital_mode === "capital_compounded";
 
+  const { data: vixData } = useBacktestVix(runId, isCompounded);
+
   // For compounded: use the single analytics row directly.
   // For refresh: merge all per-window analytics into one combined view.
   // Must be called unconditionally before any early returns.
@@ -385,6 +387,7 @@ export function BacktestDetail({ runId }: BacktestDetailProps) {
       monthly_returns: {},
       regime_stats: {},
       timestamps: [],
+      daily_snapshots: [],
     };
 
     for (const row of rows) {
@@ -547,6 +550,7 @@ export function BacktestDetail({ runId }: BacktestDetailProps) {
             analytics={analytics}
             perWindowAnalytics={!isCompounded ? analyticsData?.analytics : undefined}
             runs={!isCompounded ? data.runs : undefined}
+            vixData={isCompounded ? vixData : undefined}
           />
           {!isCompounded && <DrawdownCurveChart analytics={analytics} />}
           <div className="grid grid-cols-1 xl:grid-cols-2 gap-4 items-start">

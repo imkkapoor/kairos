@@ -180,6 +180,22 @@ export interface Trade {
 }
 
 // GET /api/backtest/analytics (Phase 4.9)
+export interface BacktestSnapshotPosition {
+  qty: number;
+  avg_cost_usd: number;
+  market_value_usd: number;
+  strategy: string;
+  sector: string;
+}
+
+export interface BacktestDailySnapshot {
+  date: string;
+  positions: Record<string, BacktestSnapshotPosition>;
+  cash: number;
+  total_value: number;
+  total_pnl: number;
+}
+
 export interface BacktestAnalytics {
   backtest_id: number;
   equity_curve: number[];
@@ -187,8 +203,15 @@ export interface BacktestAnalytics {
   monthly_returns: Record<string, Record<string, number>>;
   regime_stats: Record<string, Record<string, number>>;
   timestamps: string[];
+  daily_snapshots: BacktestDailySnapshot[];
 }
 
 export interface BacktestAnalyticsResponse {
   analytics: BacktestAnalytics[];
+}
+
+// GET /api/backtest/vix
+export interface BacktestVixResponse {
+  timestamps: string[];
+  vix: (number | null)[];
 }

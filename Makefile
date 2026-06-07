@@ -77,17 +77,17 @@ setup: _guard-docker _guard-venv
 run: _guard-docker _guard-venv
 	caffeinate -i $(PYTHON) backend/scheduler.py
 
-## scan: Run the daily signal scan once immediately (skips schedule)
+## scan: Run the daily signal scan once  (DATE=YYYY-MM-DD for historical replay)
 scan: _guard-docker _guard-venv
-	$(PYTHON) -c "import sys; sys.path.insert(0, 'backend'); from strategies.scanner import run_daily_scan; run_daily_scan()"
+	cd backend && $(abspath $(PYTHON)) -m strategies.scanner $(if $(DATE),--date $(DATE),)
 
-## simulate: Run morning order execution now (last signals + live prices)
+## simulate: Run morning order execution  (DATE=YYYY-MM-DD for historical replay)
 simulate: _guard-docker _guard-venv
-	cd backend && $(abspath $(PYTHON)) -m simulator.simulator morning
+	cd backend && $(abspath $(PYTHON)) -m simulator.simulator morning $(if $(DATE),--date $(DATE),)
 
-## simulate-evening: Run evening position management now (DB close prices)
+## simulate-evening: Run evening position management  (DATE=YYYY-MM-DD for historical replay)
 simulate-evening: _guard-docker _guard-venv
-	cd backend && $(abspath $(PYTHON)) -m simulator.simulator evening
+	cd backend && $(abspath $(PYTHON)) -m simulator.simulator evening $(if $(DATE),--date $(DATE),)
 
 ## api: Start the FastAPI server on port 8000 (auto-reload on file changes)
 api: _guard-docker _guard-venv

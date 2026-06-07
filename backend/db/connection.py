@@ -284,6 +284,7 @@ def get_price_data(
     interval: str = "1d",
     limit: Optional[int] = None,
     start: Optional[datetime] = None,
+    end: Optional[datetime] = None,
 ) -> pd.DataFrame:
     """Return OHLCV data for a ticker as a UTC-indexed DataFrame.
 
@@ -297,6 +298,9 @@ def get_price_data(
         If set, return only the most recent N rows.
     start:
         If set, only return rows at or after this UTC-aware datetime.
+    end:
+        If set, only return rows strictly before this UTC-aware datetime.
+        Pass the start of the next day to include the full target day.
 
     Returns
     -------
@@ -312,6 +316,11 @@ def get_price_data(
         start = to_utc(start)
         conditions.append("time >= :start")
         params["start"] = start
+
+    if end is not None:
+        end = to_utc(end)
+        conditions.append("time < :end")
+        params["end"] = end
 
     where = " AND ".join(conditions)
     if limit:
@@ -697,7 +706,7 @@ def get_latest_price_bars(
 
 
 def get_latest_indicators(
-    tickers: list[str], interval: str = "1d"
+    tickers: list[str], interval: str = "1d", for_date: Optional[datetime] = None
 ) -> dict[str, dict]:
     """Return the most recent indicator row per ticker in a single query.
 
@@ -707,54 +716,79 @@ def get_latest_indicators(
     so date-filtered get_todays_indicators() would return nothing for the same
     calendar day the scan ran.
 
+    Parameters
+    ----------
+    for_date:
+        When set, only considers indicator rows strictly before the start of
+        the next day (i.e. rows on or before for_date). Use this for historical
+        replay so future data is not leaked.
+
     Returns {ticker: row_dict}. Absent tickers have no data in the DB.
     """
     if not tickers:
         return {}
 
     engine = get_engine()
+    conditions = "ticker = ANY(:tickers) AND interval = :interval"
+    params: dict = {"tickers": tickers, "interval": interval}
+    if for_date is not None:
+        end_utc = (to_utc(for_date) + timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        conditions += " AND time < :end"
+        params["end"] = end_utc
     query = text(
-        """
+        f"""
         SELECT DISTINCT ON (ticker) *
         FROM indicators
-        WHERE ticker = ANY(:tickers) AND interval = :interval
+        WHERE {conditions}
         ORDER BY ticker, time DESC
         """
     )
-    df = pd.read_sql(
-        query, engine, params={"tickers": tickers, "interval": interval}
-    )
+    df = pd.read_sql(query, engine, params=params)
     if df.empty:
         return {}
     return {row["ticker"]: row.to_dict() for _, row in df.iterrows()}
 
 
 def get_prev_indicators(
-    tickers: list[str], interval: str = "1d"
+    tickers: list[str], interval: str = "1d", for_date: Optional[datetime] = None
 ) -> dict[str, dict]:
     """Return the second most recent indicator row per ticker.
 
     Uses ROW_NUMBER() DESC so weekends and holidays are handled correctly —
     never assumes the previous row is exactly one calendar day back.
+
+    Parameters
+    ----------
+    for_date:
+        When set, only considers rows strictly before start of the next day
+        so historical replay does not leak future data.
     """
     if not tickers:
         return {}
 
     engine = get_engine()
+    conditions = "ticker = ANY(:tickers) AND interval = :interval"
+    params: dict = {"tickers": tickers, "interval": interval}
+    if for_date is not None:
+        end_utc = (to_utc(for_date) + timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        conditions += " AND time < :end"
+        params["end"] = end_utc
     query = text(
-        """
+        f"""
         WITH ranked AS (
             SELECT *,
                    ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY time DESC) AS rn
             FROM indicators
-            WHERE ticker = ANY(:tickers) AND interval = :interval
+            WHERE {conditions}
         )
         SELECT * FROM ranked WHERE rn = 2
         """
     )
-    df = pd.read_sql(
-        query, engine, params={"tickers": tickers, "interval": interval}
-    )
+    df = pd.read_sql(query, engine, params=params)
     if df.empty:
         return {}
     return {row["ticker"]: row.to_dict() for _, row in df.iterrows()}
@@ -1209,12 +1243,20 @@ def get_peak_portfolio_value() -> float:
     return float(val) if val is not None else initial
 
 
-def get_latest_close_prices(tickers: list[str]) -> dict[str, float]:
+def get_latest_close_prices(
+    tickers: list[str], for_date: Optional[datetime] = None
+) -> dict[str, float]:
     """Return the most recent closing price per ticker from price_data.
 
     Reads from the DB only — no yfinance call. The 5:00 PM data fetch writes
     today's close to price_data, so this is safe to call at 5:25 PM ET.
     Used by run_evening() so it never makes a live network request.
+
+    Parameters
+    ----------
+    for_date:
+        When set, returns the most recent close on or before this date
+        (strictly before start of the next day). Use for historical replay.
 
     Returns {ticker: close_price} for all requested tickers that have data.
     Tickers with no rows in price_data are simply absent from the result.
@@ -1223,16 +1265,31 @@ def get_latest_close_prices(tickers: list[str]) -> dict[str, float]:
         return {}
 
     engine = get_engine()
-    query = text(
-        """
-        SELECT DISTINCT ON (ticker) ticker, close
-        FROM price_data
-        WHERE ticker = ANY(:tickers)
-        ORDER BY ticker, time DESC
-        """
-    )
-    with engine.connect() as conn:
-        rows = conn.execute(query, {"tickers": tickers}).fetchall()
+    if for_date is not None:
+        end_utc = (to_utc(for_date) + timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        query = text(
+            """
+            SELECT DISTINCT ON (ticker) ticker, close
+            FROM price_data
+            WHERE ticker = ANY(:tickers) AND interval = '1d' AND time < :end
+            ORDER BY ticker, time DESC
+            """
+        )
+        with engine.connect() as conn:
+            rows = conn.execute(query, {"tickers": tickers, "end": end_utc}).fetchall()
+    else:
+        query = text(
+            """
+            SELECT DISTINCT ON (ticker) ticker, close
+            FROM price_data
+            WHERE ticker = ANY(:tickers)
+            ORDER BY ticker, time DESC
+            """
+        )
+        with engine.connect() as conn:
+            rows = conn.execute(query, {"tickers": tickers}).fetchall()
     return {row[0]: float(row[1]) for row in rows}
 
 
@@ -1522,21 +1579,22 @@ def insert_backtest_analytics(backtest_id: int, analytics: dict) -> int:
     """Insert pre-computed chart data for a backtest window. Returns the new row id.
 
     analytics dict keys: equity_curve, drawdown_curve, monthly_returns,
-    regime_stats, timestamps.
+    regime_stats, timestamps, daily_snapshots.
     """
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO backtest_analytics
-                    (backtest_id, equity_curve, drawdown_curve, monthly_returns, regime_stats, timestamps)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                    (backtest_id, equity_curve, drawdown_curve, monthly_returns, regime_stats, timestamps, daily_snapshots)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (backtest_id) DO UPDATE SET
                     equity_curve    = EXCLUDED.equity_curve,
                     drawdown_curve  = EXCLUDED.drawdown_curve,
                     monthly_returns = EXCLUDED.monthly_returns,
                     regime_stats    = EXCLUDED.regime_stats,
-                    timestamps      = EXCLUDED.timestamps
+                    timestamps      = EXCLUDED.timestamps,
+                    daily_snapshots = EXCLUDED.daily_snapshots
                 RETURNING id
                 """,
                 (
@@ -1546,6 +1604,7 @@ def insert_backtest_analytics(backtest_id: int, analytics: dict) -> int:
                     json.dumps(analytics.get("monthly_returns")),
                     json.dumps(analytics.get("regime_stats")),
                     json.dumps(analytics.get("timestamps")),
+                    json.dumps(analytics.get("daily_snapshots")),
                 ),
             )
             return cur.fetchone()[0]
@@ -1559,7 +1618,7 @@ def get_backtest_analytics(backtest_ids: list[int]) -> list[dict]:
     query = text(
         """
         SELECT backtest_id, equity_curve, drawdown_curve, monthly_returns,
-               regime_stats, timestamps
+               regime_stats, timestamps, daily_snapshots
         FROM backtest_analytics
         WHERE backtest_id = ANY(:ids)
         ORDER BY backtest_id ASC

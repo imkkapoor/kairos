@@ -308,7 +308,7 @@ def main() -> None:
                     run_id = str(uuid.uuid4())
                     run_ids.append(run_id)
                     for res in win_results:
-                        db_row = {k: v for k, v in res.items() if k not in ("equity_curve", "circuit_breaker_days", "effective_mult_by_day", "trade_log")}
+                        db_row = {k: v for k, v in res.items() if k not in ("equity_curve", "circuit_breaker_days", "effective_mult_by_day", "trade_log", "daily_snapshots")}
                         db_row["currency"] = currency
                         db_row["run_id"]   = run_id
                         bt_id = insert_backtest_result(db_row)
@@ -356,7 +356,7 @@ def main() -> None:
                 run_id = str(uuid.uuid4())
                 run_ids.append(run_id)
                 for res in win_results:
-                    db_row = {k: v for k, v in res.items() if k not in ("equity_curve", "circuit_breaker_days", "effective_mult_by_day", "trade_log")}
+                    db_row = {k: v for k, v in res.items() if k not in ("equity_curve", "circuit_breaker_days", "effective_mult_by_day", "trade_log", "daily_snapshots")}
                     db_row["currency"] = currency
                     db_row["run_id"]   = run_id
                     bt_id = insert_backtest_result(db_row)

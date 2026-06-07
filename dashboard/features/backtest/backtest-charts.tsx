@@ -2,13 +2,13 @@
 
 import { useMemo } from "react";
 import {
-  Area,
-  AreaChart,
   CartesianGrid,
   Line,
   LineChart,
   XAxis,
   YAxis,
+  Area,
+  AreaChart,
 } from "recharts";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import {
@@ -17,14 +17,21 @@ import {
   ChartTooltip,
   ChartTooltipContent,
 } from "@/components/ui/chart";
-import type { BacktestAnalytics, BacktestRun } from "@/lib/types/api";
+import type { BacktestAnalytics, BacktestRun, BacktestVixResponse } from "@/lib/types/api";
 
 // ---------------------------------------------------------------------------
 // Equity Curve
 // ---------------------------------------------------------------------------
 
+const INVESTED_COLOR = "#6366f1"; // indigo
+const CASH_COLOR     = "#f59e0b"; // amber
+const VIX_COLOR      = "#94a3b8"; // slate-400
+
 const equityConfig = {
-  value: { label: "Portfolio Value", color: "var(--chart-1)" },
+  total_value: { label: "Total Value", color: "var(--chart-1)" },
+  invested:    { label: "Invested",    color: INVESTED_COLOR },
+  cash:        { label: "Cash",        color: CASH_COLOR },
+  vix:         { label: "VIX",         color: VIX_COLOR },
 } satisfies ChartConfig;
 
 // 20 distinct colours for per-window lines
@@ -41,9 +48,11 @@ interface EquityCurveChartProps {
   perWindowAnalytics?: BacktestAnalytics[];
   /** Backtest runs — used to label windows by index */
   runs?: BacktestRun[];
+  /** VIX overlay — only shown in compounded (single-curve) mode */
+  vixData?: BacktestVixResponse;
 }
 
-export function EquityCurveChart({ analytics, perWindowAnalytics, runs }: EquityCurveChartProps) {
+export function EquityCurveChart({ analytics, perWindowAnalytics, runs, vixData }: EquityCurveChartProps) {
   // Multi-window refresh mode
   const multiData = useMemo(() => {
     if (!perWindowAnalytics?.length) return null;
@@ -83,11 +92,30 @@ export function EquityCurveChart({ analytics, perWindowAnalytics, runs }: Equity
   // Single equity curve (compounded mode or single-window)
   const singleData = useMemo(() => {
     if (!analytics.equity_curve?.length) return [];
-    return analytics.timestamps.map((ts, i) => ({
-      date: ts,
-      value: analytics.equity_curve[i],
-    }));
-  }, [analytics]);
+    const snapshots = analytics.daily_snapshots ?? [];
+
+    // Build date → VIX lookup from the separate VIX response
+    const vixByDate = new Map<string, number | null>();
+    if (vixData?.timestamps.length) {
+      vixData.timestamps.forEach((ts, i) => {
+        vixByDate.set(ts.slice(0, 10), vixData.vix[i] ?? null);
+      });
+    }
+
+    return analytics.timestamps.map((ts, i) => {
+      const totalVal = analytics.equity_curve[i];
+      const cash = snapshots[i]?.cash ?? null;
+      const invested = cash != null ? +(totalVal - cash).toFixed(2) : null;
+      const dateKey = ts.slice(0, 10);
+      return {
+        date: ts,
+        total_value: totalVal,
+        cash,
+        invested,
+        vix: vixByDate.size > 0 ? (vixByDate.get(dateKey) ?? null) : undefined,
+      };
+    });
+  }, [analytics, vixData]);
 
   // Multi-window line chart
   if (multiData) {
@@ -189,9 +217,20 @@ export function EquityCurveChart({ analytics, perWindowAnalytics, runs }: Equity
   // Single equity curve (compounded mode)
   if (!singleData.length) return null;
 
-  const firstVal = singleData[0].value;
-  const lastVal = singleData[singleData.length - 1].value;
+  const firstVal = singleData[0].total_value;
+  const lastVal = singleData[singleData.length - 1].total_value;
   const lineColor = lastVal >= firstVal ? "var(--profit)" : "var(--loss)";
+  const hasCash = singleData.some((d) => d.cash != null);
+  const hasVix = singleData.some((d) => d.vix != null);
+
+  const legendItems = [
+    { key: "total_value", label: "Total Value", color: lineColor },
+    ...(hasCash ? [
+      { key: "invested", label: "Invested", color: INVESTED_COLOR },
+      { key: "cash",     label: "Cash",     color: CASH_COLOR },
+    ] : []),
+    ...(hasVix ? [{ key: "vix", label: "VIX", color: VIX_COLOR }] : []),
+  ];
 
   return (
     <Card>
@@ -200,13 +239,7 @@ export function EquityCurveChart({ analytics, perWindowAnalytics, runs }: Equity
       </CardHeader>
       <CardContent>
         <ChartContainer config={equityConfig} className="h-[32rem] w-full">
-          <AreaChart data={singleData} margin={{ top: 4, right: 4, bottom: 0, left: 0 }}>
-            <defs>
-              <linearGradient id="fill-equity" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="5%" stopColor={lineColor} stopOpacity={0.3} />
-                <stop offset="95%" stopColor={lineColor} stopOpacity={0} />
-              </linearGradient>
-            </defs>
+          <LineChart data={singleData} margin={{ top: 4, right: hasVix ? 48 : 4, bottom: 0, left: 0 }}>
             <CartesianGrid strokeDasharray="3 3" vertical={false} className="stroke-border" />
             <XAxis
               dataKey="date"
@@ -218,6 +251,7 @@ export function EquityCurveChart({ analytics, perWindowAnalytics, runs }: Equity
               tickFormatter={(v: string) => v.slice(0, 7)}
             />
             <YAxis
+              yAxisId="equity"
               tickLine={false}
               axisLine={false}
               tickMargin={8}
@@ -227,27 +261,111 @@ export function EquityCurveChart({ analytics, perWindowAnalytics, runs }: Equity
               }
               domain={["auto", "auto"]}
             />
+            {hasVix && (
+              <YAxis
+                yAxisId="vix"
+                orientation="right"
+                tickLine={false}
+                axisLine={false}
+                tickMargin={8}
+                tick={{ fontSize: 10, fill: VIX_COLOR }}
+                tickFormatter={(v: number) => v.toFixed(0)}
+                domain={["auto", "auto"]}
+                width={40}
+              />
+            )}
             <ChartTooltip
-              content={
-                <ChartTooltipContent
-                  labelFormatter={(label) => String(label)}
-                  formatter={(value) =>
-                    `$${(value as number).toLocaleString(undefined, { minimumFractionDigits: 2 })}`
-                  }
-                />
-              }
+              content={({ active, payload, label }) => {
+                if (!active || !payload?.length) return null;
+                const order = ["total_value", "invested", "cash", "vix"];
+                const sorted = [...payload].sort(
+                  (a, b) => order.indexOf(String(a.dataKey)) - order.indexOf(String(b.dataKey)),
+                );
+                return (
+                  <div className="min-w-40 rounded-lg border border-border/50 bg-background px-2.5 py-1.5 text-xs shadow-xl">
+                    <p className="mb-1 font-medium">{String(label)}</p>
+                    <div className="grid gap-1">
+                      {sorted
+                        .filter((p) => p.value != null)
+                        .map((p) => (
+                          <div key={String(p.dataKey)} className="flex items-center gap-2">
+                            <span
+                              className="inline-block h-2.5 w-2.5 shrink-0 rounded-[2px]"
+                              style={{ backgroundColor: p.color }}
+                            />
+                            <span className="text-muted-foreground">{p.name}</span>
+                            <span className="ml-auto font-mono font-medium tabular-nums">
+                              {p.dataKey === "vix"
+                                ? (p.value as number).toFixed(1)
+                                : `$${(p.value as number).toLocaleString(undefined, { minimumFractionDigits: 2 })}`}
+                            </span>
+                          </div>
+                        ))}
+                    </div>
+                  </div>
+                );
+              }}
             />
-            <Area
+            <Line
+              yAxisId="equity"
               type="monotone"
-              dataKey="value"
+              dataKey="total_value"
+              name="Total Value"
               stroke={lineColor}
               strokeWidth={2}
-              fill="url(#fill-equity)"
               dot={false}
               activeDot={{ r: 3 }}
             />
-          </AreaChart>
+            {hasCash && (
+              <Line
+                yAxisId="equity"
+                type="monotone"
+                dataKey="invested"
+                name="Invested"
+                stroke={INVESTED_COLOR}
+                strokeWidth={1.5}
+                strokeDasharray="5 3"
+                dot={false}
+                activeDot={{ r: 3 }}
+              />
+            )}
+            {hasCash && (
+              <Line
+                yAxisId="equity"
+                type="monotone"
+                dataKey="cash"
+                name="Cash"
+                stroke={CASH_COLOR}
+                strokeWidth={1.5}
+                strokeDasharray="5 3"
+                dot={false}
+                activeDot={{ r: 3 }}
+              />
+            )}
+            {hasVix && (
+              <Line
+                yAxisId="vix"
+                type="monotone"
+                dataKey="vix"
+                name="VIX"
+                stroke={VIX_COLOR}
+                strokeWidth={1}
+                strokeOpacity={0.6}
+                dot={false}
+                activeDot={{ r: 2 }}
+                connectNulls={false}
+              />
+            )}
+          </LineChart>
         </ChartContainer>
+        <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 px-1">
+          {legendItems.map(({ key, label, color }) => (
+            <span key={key} className="flex items-center gap-1 text-[10px] text-muted-foreground">
+              <span className="inline-block h-2 w-3 shrink-0 rounded-sm" style={{ backgroundColor: color }} />
+              {label}
+            </span>
+          ))}
+        </div>
       </CardContent>
     </Card>
   );

@@ -8,6 +8,7 @@ import type {
   BacktestRunListResponse,
   TickerChartResponse,
   BacktestAnalyticsResponse,
+  BacktestVixResponse,
 } from "../types/api";
 
 // ---------------------------------------------------------------------------
@@ -20,6 +21,7 @@ export const queryKeys = {
   backtest: (runId?: string) => ["backtest", runId ?? "all"] as const,
   backtestRuns: ["backtest-runs"] as const,
   backtestAnalytics: (runId: string) => ["backtest-analytics", runId] as const,
+  backtestVix: (runId: string) => ["backtest-vix", runId] as const,
 };
 
 // ---------------------------------------------------------------------------
@@ -56,6 +58,13 @@ async function fetchBacktestRuns(): Promise<BacktestRunListResponse> {
 async function fetchBacktestAnalytics(runId: string): Promise<BacktestAnalyticsResponse> {
   const res = await apiClient.get<BacktestAnalyticsResponse>(
     `/api/backtest/analytics?run_id=${encodeURIComponent(runId)}`,
+  );
+  return res.data;
+}
+
+async function fetchBacktestVix(runId: string): Promise<BacktestVixResponse> {
+  const res = await apiClient.get<BacktestVixResponse>(
+    `/api/backtest/vix?run_id=${encodeURIComponent(runId)}`,
   );
   return res.data;
 }
@@ -112,5 +121,14 @@ export function useBacktestAnalytics(runId: string) {
     queryKey: queryKeys.backtestAnalytics(runId),
     queryFn: () => fetchBacktestAnalytics(runId),
     staleTime: 5 * 60_000,
+  });
+}
+
+export function useBacktestVix(runId: string, enabled: boolean) {
+  return useQuery({
+    queryKey: queryKeys.backtestVix(runId),
+    queryFn: () => fetchBacktestVix(runId),
+    staleTime: 5 * 60_000,
+    enabled,
   });
 }

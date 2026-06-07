@@ -38,7 +38,11 @@ export const positionsColumns: ColumnDef<PositionRow>[] = [
     enableSorting: true,
     cell: ({ row }) => {
       const v = row.getValue("avg_cost") as number | null | undefined;
-      return v != null ? <span className="font-mono">${v.toFixed(2)}</span> : "—";
+      return v != null ? (
+        <span className="font-mono">${v.toFixed(2)}</span>
+      ) : (
+        "—"
+      );
     },
   },
   {
@@ -47,7 +51,11 @@ export const positionsColumns: ColumnDef<PositionRow>[] = [
     enableSorting: true,
     cell: ({ row }) => {
       const v = row.getValue("stop_loss") as number | null | undefined;
-      return v != null ? <span className="font-mono">${v.toFixed(2)}</span> : "—";
+      return v != null ? (
+        <span className="font-mono">${v.toFixed(2)}</span>
+      ) : (
+        "—"
+      );
     },
   },
   {
@@ -56,7 +64,11 @@ export const positionsColumns: ColumnDef<PositionRow>[] = [
     enableSorting: true,
     cell: ({ row }) => {
       const v = row.getValue("take_profit") as number | null | undefined;
-      return v != null ? <span className="font-mono">${v.toFixed(2)}</span> : "—";
+      return v != null ? (
+        <span className="font-mono">${v.toFixed(2)}</span>
+      ) : (
+        "—"
+      );
     },
   },
   {
@@ -75,7 +87,11 @@ export const positionsColumns: ColumnDef<PositionRow>[] = [
     enableSorting: true,
     cell: ({ row }) => {
       const v = row.getValue("price") as number | null | undefined;
-      return v != null ? <span className="font-mono">${v.toFixed(2)}</span> : "—";
+      return v != null ? (
+        <span className="font-mono">${v.toFixed(2)}</span>
+      ) : (
+        "—"
+      );
     },
   },
   {
@@ -91,7 +107,9 @@ export const positionsColumns: ColumnDef<PositionRow>[] = [
       const sign = chg >= 0 ? "+" : "";
       return (
         <span className={`font-mono ${color}`}>
-          {sign}{chg.toFixed(2)} ({sign}{pct.toFixed(2)}%)
+          {sign}
+          {chg.toFixed(2)} ({sign}
+          {pct.toFixed(2)}%)
         </span>
       );
     },
@@ -108,15 +126,35 @@ export const positionsColumns: ColumnDef<PositionRow>[] = [
       const price = row.original.price;
       const avgCost = row.original.avg_cost;
       if (price == null || avgCost == null) return "—";
-      const pnl = (price - avgCost) * row.original.qty * (row.original.fx_rate ?? 1);
+      const pnl =
+        (price - avgCost) * row.original.qty * (row.original.fx_rate ?? 1);
       const pnlPct = ((price - avgCost) / avgCost) * 100;
       const color = pnl >= 0 ? "text-profit" : "text-loss";
       const sign = pnl >= 0 ? "+" : "";
       return (
         <span className={`font-mono ${color}`}>
-          {sign}{pnl.toFixed(2)} ({sign}{pnlPct.toFixed(2)}%)
+          {sign}
+          {pnl.toFixed(2)} ({sign}
+          {pnlPct.toFixed(2)}%)
         </span>
       );
+    },
+  },
+  {
+    id: "current_value",
+    header: "Current Value",
+    enableSorting: true,
+    accessorFn: (row) => {
+      if (row.price == null) return null;
+      return row.price * row.qty * (row.fx_rate ?? 1);
+    },
+    cell: ({ row }) => {
+      const price = row.original.price;
+      const avgCost = row.original.avg_cost;
+      if (price == null) return "—";
+      const value = price * row.original.qty * (row.original.fx_rate ?? 1);
+      const color = price >= avgCost ? "text-profit" : "text-loss";
+      return <span className={`font-mono ${color}`}>${value.toFixed(2)}</span>;
     },
   },
 ];

@@ -29,6 +29,7 @@ from db.connection import (
     get_backtest_run_list,
     get_price_data,
     get_backtest_analytics,
+    get_vix_range,
 )
 
 # ---------------------------------------------------------------------------
@@ -262,6 +263,25 @@ def get_analytics(run_id: str):
         backtest_ids = df["id"].tolist()
         rows = get_backtest_analytics(backtest_ids)
         return {"analytics": [_serialise(r) for r in rows]}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/backtest/vix")
+def get_backtest_vix(run_id: str):
+    """VIX daily close aligned to the backtest window — used to overlay on equity curve."""
+    try:
+        df = get_backtest_results(run_id=run_id)
+        if df.empty:
+            return {"timestamps": [], "vix": []}
+        window_start = df["window_start"].min()
+        window_end = df["window_end"].max()
+        vix = get_vix_range(window_start, window_end)
+        if vix.empty:
+            return {"timestamps": [], "vix": []}
+        timestamps = [ts.strftime("%Y-%m-%d") for ts in vix.index]
+        values = [round(float(v), 2) if not math.isnan(v) else None for v in vix.values]
+        return {"timestamps": timestamps, "vix": values}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 

@@ -212,6 +212,7 @@ CREATE TABLE IF NOT EXISTS backtest_analytics (
     monthly_returns JSONB,           -- Nested: Year -> Month -> return value
     regime_stats    JSONB,           -- Nested: Strategy -> Regime -> net PnL
     timestamps      JSONB,           -- Array of ISO date strings (aligns with curves)
+    daily_snapshots JSONB,           -- Array of {date, positions, cash, total_value, total_pnl}
     UNIQUE(backtest_id)
 );
 
