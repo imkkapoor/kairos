@@ -501,7 +501,7 @@ def execute_signals(
             original_qty      = portfolio.positions[ticker]["qty"]
             sell_ccy  = portfolio.positions[ticker].get("currency", "USD")
             sell_fx   = fx_rates.get(sell_ccy, portfolio.positions[ticker].get("fx_rate", 1.0))
-            pnl = portfolio.close_position(ticker, fill_price)
+            pnl = portfolio.close_position(ticker, fill_price, fx_rate=sell_fx)
             trade = {
                 "ticker":          ticker,
                 "side":            "sell",

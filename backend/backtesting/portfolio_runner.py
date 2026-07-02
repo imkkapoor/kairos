@@ -399,6 +399,13 @@ def run_window(
     # carry forward the last known close to avoid $0 valuation (holiday gap fix).
     last_known_close: dict[str, float] = {}
 
+    # Previous-day close prices for sizing at day T's Open. Sizing decisions must
+    # not use day T's Close (that's lookahead — see AUDIT.md [C2]). Populated at
+    # the end of each iteration from today's Close. On the very first day of the
+    # window this dict is empty; the sizing block falls back to today's Open,
+    # which is knowable at the 9:31 ET fill time and therefore not lookahead.
+    prev_close_prices: dict[str, float] = {}
+
     # Rolling indicator cache: replicates live scanner timing.
     # The live scanner runs at 17:15 ET on day T using T's close data,
     # and trades execute at T+1's Open.  So for a trade on day_ts, the
@@ -523,10 +530,11 @@ def run_window(
 
             # Phase 4.10: VIX lookup for hard-CB time/market recovery
             # Use 3-day trailing average to smooth single-day VIX flickers.
+            # Strict-less-than: day T's close is not knowable at day T's Open — [C3].
             _hard_vix = None
             if vix_series is not None and not vix_series.empty:
                 _vix_ts = pd.Timestamp(day_date, tz="UTC")
-                _prior_vix = vix_series[vix_series.index <= _vix_ts]
+                _prior_vix = vix_series[vix_series.index < _vix_ts]
                 if not _prior_vix.empty:
                     _hard_vix = float(_prior_vix.iloc[-3:].mean())
 
@@ -618,10 +626,11 @@ def run_window(
             # ── Phase 4.10: Multi-trigger recovery ("whichever comes first") ──
             # Track VIX consecutive days below threshold for market-condition trigger.
             # Use 3-day trailing average to smooth single-day VIX flickers.
+            # Strict-less-than: day T's close is not knowable at day T's Open — [C3].
             _today_vix = None
             if vix_series is not None and not vix_series.empty:
                 _vix_ts = pd.Timestamp(day_date, tz="UTC")
-                _prior = vix_series[vix_series.index <= _vix_ts]
+                _prior = vix_series[vix_series.index < _vix_ts]
                 if not _prior.empty:
                     _today_vix = float(_prior.iloc[-3:].mean())
 
@@ -854,7 +863,14 @@ def run_window(
             is_cad = tkr.endswith(".TO")
             risk_per_usd = risk_per_native * fx_today if is_cad else risk_per_native
 
-            total_val      = portfolio.get_total_value(close_prices, fx_today)
+            # Sizing prices: use YESTERDAY's close (or today's open on the first day
+            # of the window when no prev close is available). Never today's close —
+            # that's lookahead at the 9:31 ET Open fill time (AUDIT.md [C2]).
+            sizing_prices: dict[str, float] = {
+                t: prev_close_prices.get(t, open_prices.get(t, 0.0))
+                for t in set(prev_close_prices) | set(open_prices)
+            }
+            total_val      = portfolio.get_total_value(sizing_prices, fx_today)
             effective_mult  = size_mult * cb_mult
             if effective_mult == 0.0:
                 continue  # hard stop: no new BUYs (soft CB or binary CB)
@@ -882,9 +898,10 @@ def run_window(
                 cost_native = qty * fill_price
                 cost_usd    = cost_native * fx_today if is_cad else cost_native
 
-            # Partial fill if exposure cap reached
+            # Partial fill if exposure cap reached — invested valued at sizing_prices
+            # (yesterday's close / today's open), NOT today's close.
             invested = sum(
-                pos["qty"] * close_prices.get(t, 0.0) * (fx_today if pos["is_cad"] else 1.0)
+                pos["qty"] * sizing_prices.get(t, 0.0) * (fx_today if pos["is_cad"] else 1.0)
                 for t, pos in portfolio.positions.items()
             )
             remaining = (portfolio.max_total_exposure - invested / total_val) * total_val
@@ -899,7 +916,7 @@ def run_window(
 
             sector = sector_map.get(tkr, "Unknown")
             allowed, _ = portfolio.can_open(
-                tkr, cost_usd, sector, close_prices, fx_today,
+                tkr, cost_usd, sector, sizing_prices, fx_today,
                 effective_max_positions, max_sector_exposure,
             )
             if not allowed:
@@ -969,6 +986,10 @@ def run_window(
         # would have generated overnight.
         _scan_prev_ind = _scan_ind
         _scan_ind      = today_ind
+
+        # Advance prev_close_prices: tomorrow's sizing must see today's close
+        # (which is knowable at tomorrow's 9:31 ET Open), never tomorrow's close.
+        prev_close_prices = dict(close_prices)
 
     # ── Force-close any remaining positions at last Close ─────────────────
     if equity_curve:

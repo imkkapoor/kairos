@@ -1133,58 +1133,6 @@ def get_trade_history(
     return df
 
 
-def get_portfolio_stats() -> dict:
-    """Return aggregate trade performance stats.
-
-    Returns
-    -------
-    dict with keys:
-        total_trades, winning_trades, win_rate, avg_win, avg_loss, total_pnl
-    """
-    engine = get_engine()
-    # Join buy and sell trades to compute per-trade PnL
-    query = text(
-        """
-        SELECT
-            buy.ticker,
-            buy.quantity,
-            buy.fill_price                         AS buy_price,
-            sell.fill_price                        AS sell_price,
-            (sell.fill_price - buy.fill_price) * buy.quantity AS pnl
-        FROM trades buy
-        JOIN trades sell
-          ON sell.ticker = buy.ticker
-         AND sell.side   = 'sell'
-         AND sell.strategy = buy.strategy
-        WHERE buy.side = 'buy'
-          AND buy.status = 'closed'
-        """
-    )
-    df = pd.read_sql(query, engine)
-
-    if df.empty:
-        return {
-            "total_trades":   0,
-            "winning_trades": 0,
-            "win_rate":       0.0,
-            "avg_win":        0.0,
-            "avg_loss":       0.0,
-            "total_pnl":      0.0,
-        }
-
-    total  = len(df)
-    wins   = df[df["pnl"] > 0]
-    losses = df[df["pnl"] <= 0]
-    return {
-        "total_trades":   total,
-        "winning_trades": len(wins),
-        "win_rate":       round(len(wins) / total, 4) if total > 0 else 0.0,
-        "avg_win":        round(wins["pnl"].mean(), 2) if not wins.empty else 0.0,
-        "avg_loss":       round(losses["pnl"].mean(), 2) if not losses.empty else 0.0,
-        "total_pnl":      round(df["pnl"].sum(), 2),
-    }
-
-
 def get_latest_atr(ticker: str) -> Optional[float]:
     """Return the most recent atr_14 value for a ticker from the indicators table.
 

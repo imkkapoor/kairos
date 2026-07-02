@@ -195,7 +195,9 @@ def run_morning(for_date: Optional[datetime] = None) -> None:
             portfolio, current_prices, today_indicators, todays_signals
         )
         for action in close_actions:
-            pnl = portfolio.close_position(action["ticker"], action["exit_price"])
+            pos_ccy = portfolio.positions.get(action["ticker"], {}).get("currency", "USD")
+            pos_fx  = fx_rates.get(pos_ccy, 1.0)
+            pnl = portfolio.close_position(action["ticker"], action["exit_price"], fx_rate=pos_fx)
             close_trade(action["ticker"], action["exit_price"], action["reason"], trade_time=trade_time)
             summary_pre_open_closed.append({
                 "ticker":     action["ticker"],
@@ -422,7 +424,9 @@ def run_evening(for_date: Optional[datetime] = None) -> None:
         ticker     = action["ticker"]
         exit_price = action["exit_price"]
         reason     = action["reason"]
-        pnl = portfolio.close_position(ticker, exit_price)
+        pos_ccy    = portfolio.positions.get(ticker, {}).get("currency", "USD")
+        pos_fx     = fx_rates.get(pos_ccy, 1.0)
+        pnl = portfolio.close_position(ticker, exit_price, fx_rate=pos_fx)
         close_trade(ticker, exit_price, reason)
         summary_closed.append({
             "ticker":     ticker,
@@ -561,7 +565,9 @@ def run_intraday() -> None:
         ticker     = action["ticker"]
         exit_price = action["exit_price"]
         reason     = action["reason"]
-        pnl = portfolio.close_position(ticker, exit_price)
+        pos_ccy    = portfolio.positions.get(ticker, {}).get("currency", "USD")
+        pos_fx     = fx_rates.get(pos_ccy, 1.0)
+        pnl = portfolio.close_position(ticker, exit_price, fx_rate=pos_fx)
         close_trade(ticker, exit_price, reason)
         summary_closed.append({
             "ticker":     ticker,

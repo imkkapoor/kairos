@@ -101,21 +101,25 @@ def is_vix_spike(
 
     Returns
     -------
-    bool — True if today_vix > sma * (1 + threshold), False otherwise.
-    Returns False if fewer than sma_window data points precede as_of_date.
+    bool — True if the most recent VIX close strictly BEFORE as_of_date
+    exceeds sma * (1 + threshold). Returns False if fewer than sma_window
+    data points precede as_of_date.
+
+    Note: day T's VIX close is not knowable at day T's 9:31 ET Open fill,
+    so the slice is strictly ``< as_of_date`` — see AUDIT.md [C3].
     """
     if vix_series is None or vix_series.empty:
         return False
 
     target_ts = pd.Timestamp(as_of_date, tz="UTC")
 
-    # All data up to and including as_of_date
-    prior = vix_series[vix_series.index <= target_ts]
+    # All data strictly BEFORE as_of_date (day T's close is lookahead at day T's open)
+    prior = vix_series[vix_series.index < target_ts]
     if len(prior) < sma_window:
         return False
 
     today_vix = float(prior.iloc[-1])
-    # SMA uses the last sma_window values including today
+    # SMA uses the last sma_window values ending with the most recent PRIOR bar
     sma = float(prior.iloc[-sma_window:].mean())
     if sma <= 0:
         return False
@@ -140,9 +144,10 @@ def get_vix_regime(
     never downgrades.
 
     Fallback chain:
-        1. Exact date match in vix_series.
-        2. Last known value before as_of_date (handles weekends/holidays).
-        3. NORMAL if no data at all (fail-open).
+        1. Most recent value STRICTLY BEFORE as_of_date (handles weekends/holidays).
+           Day T's VIX close is not knowable at day T's 9:31 ET Open — see
+           AUDIT.md [C3].
+        2. NORMAL if no data at all (fail-open).
 
     Parameters
     ----------
@@ -179,14 +184,11 @@ def get_vix_regime(
 
     vix_value: Optional[float] = None
 
-    # Exact day match
-    if target_ts in vix_series.index:
-        vix_value = float(vix_series.loc[target_ts])
-    else:
-        # Most recent value on or before as_of_date
-        candidates = vix_series[vix_series.index <= target_ts]
-        if not candidates.empty:
-            vix_value = float(candidates.iloc[-1])
+    # Most recent value STRICTLY BEFORE as_of_date. Day T's VIX close is not
+    # knowable at day T's 9:31 ET Open — see AUDIT.md [C3].
+    candidates = vix_series[vix_series.index < target_ts]
+    if not candidates.empty:
+        vix_value = float(candidates.iloc[-1])
 
     classification = classify_vix(vix_value)
     regime    = classification["regime"]
@@ -198,11 +200,12 @@ def get_vix_regime(
         regime    = "HIGH"
         size_mult = 0.35
 
-    # Compute VROC ratio (vix / trailing_sma - 1) for debug/logging visibility
+    # Compute VROC ratio (vix / trailing_sma - 1) for debug/logging visibility.
+    # SMA excludes day T's close for consistency with the sizing lookup — see [C3].
     vroc_ratio = 0.0
     if vix_value is not None:
         target_ts = pd.Timestamp(as_of_date, tz="UTC")
-        _prior = vix_series[vix_series.index <= target_ts]
+        _prior = vix_series[vix_series.index < target_ts]
         if len(_prior) >= sma_window:
             _sma = float(_prior.iloc[-sma_window:].mean())
             if _sma > 0:
