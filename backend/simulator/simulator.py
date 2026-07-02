@@ -15,7 +15,7 @@ TWO daily jobs (scheduled via scheduler.py):
 THIS IS THE ONLY FILE in simulator/ that calls DB write functions.
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -37,42 +37,34 @@ from db.connection import (
 from simulator.portfolio import Portfolio
 from simulator import executor
 from simulator import position_manager
+from utils.trading_calendar import prev_trading_day
 
 _ET = ZoneInfo("America/New_York")
 
 
 def _last_scan_date_utc() -> datetime:
-    """Return midnight UTC for the most recent weekday in ET.
+    """Return midnight UTC for the most recent NYSE trading day in ET.
 
     The scanner runs at 5:15 PM ET. At 9:31 AM ET the next morning, its
     signals sit in the *previous* ET calendar day's UTC window (signals are
     written ~21-22 UTC, run_morning fires ~13-14 UTC the next day).
-    Walking back to the last weekday also handles Monday mornings correctly
-    (scanner last ran Friday, not yesterday).
+    Uses `prev_trading_day` so holiday-Mondays (e.g. the Monday after Good
+    Friday) correctly walk back to the prior Thursday rather than returning
+    a non-trading Friday.
     """
-    now_et = datetime.now(_ET)
-    days_back = 1
-    while True:
-        candidate = (now_et - timedelta(days=days_back)).date()
-        if candidate.weekday() < 5:   # Mon=0 … Fri=4
-            break
-        days_back += 1
-    return datetime(candidate.year, candidate.month, candidate.day, tzinfo=timezone.utc)
+    today_et = datetime.now(_ET).date()
+    d = prev_trading_day(today_et)
+    return datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
 
 
 def _prev_weekday_utc(from_date: datetime) -> datetime:
-    """Return midnight UTC of the most recent weekday before from_date.
+    """Return midnight UTC of the most recent NYSE trading day before from_date.
 
     Used in historical replay: morning execution for date D needs signals
-    written by the scanner that ran on day D-1 (the previous trading day).
+    written by the scanner that ran on the previous trading day. Holidays
+    are skipped, not just weekends.
     """
-    candidate = from_date.date()
-    days_back = 1
-    while True:
-        d = candidate - timedelta(days=days_back)
-        if d.weekday() < 5:
-            break
-        days_back += 1
+    d = prev_trading_day(from_date.date())
     return datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
 
 

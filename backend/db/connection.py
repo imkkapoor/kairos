@@ -1302,6 +1302,11 @@ def insert_vix_data(rows: list[dict]) -> int:
 
     Each dict must have 'time' (UTC-aware datetime) and 'close' (float).
     Source defaults to 'yfinance'. ON CONFLICT DO NOTHING — safe to re-run.
+
+    Timezone contract: all vendor bars are treated as America/New_York when
+    naive (matching data/fetcher.py and data/fetch_vix.py). Callers must
+    convert to UTC before insertion so the index aligns with price_data and
+    fx_rates.
     """
     if not rows:
         return 0
