@@ -30,6 +30,7 @@ def check_positions(
     current_prices: dict,
     today_indicators: dict,
     todays_signals: list[dict],
+    as_of: Optional[datetime] = None,
 ) -> tuple[list[dict], list[dict]]:
     """Evaluate all open positions for exit / trailing stop conditions.
 
@@ -43,6 +44,10 @@ def check_positions(
         {ticker: {indicator_col: value}} from get_todays_indicators().
     todays_signals:
         List of today's signal dicts (already converted from DataFrame).
+    as_of:
+        Reference "now" for the time-based exit (age of a position). Defaults to
+        the real wall-clock UTC. Historical replay passes the replay date so a
+        catch-up run doesn't measure position age against the real present.
 
     Returns
     -------
@@ -149,7 +154,8 @@ def check_positions(
         # ------------------------------------------------------------------
         try:
             opened_at = datetime.fromisoformat(pos["opened_at"])
-            age = datetime.now(timezone.utc) - opened_at
+            now = as_of if as_of is not None else datetime.now(timezone.utc)
+            age = now - opened_at
             pnl = (price - pos["avg_cost"]) * pos["qty"]
             if age.days > 30 and pnl < 0:
                 reason = f"Time exit: {age.days}d open, P&L ${pnl:.2f}"

@@ -57,7 +57,7 @@ backend/
 │   ├── portfolio.py            ← in-memory Portfolio class (cash, positions, risk limits)
 │   └── position_manager.py     ← SL/TP/trailing/reversal/time exit checks
 ├── backtesting/
-│   ├── config.py               ← ROOS params + ~17 named allocation configs
+│   ├── config.py               ← ROOS params + 16 named allocation configs
 │   ├── data_loader.py          ← bulk DB loaders + ROOS window generator
 │   ├── portfolio_runner.py     ← day-by-day simulation engine (largest file, ~1500 lines)
 │   └── run_backtest.py         ← CLI entry point (`make backtest`)
@@ -236,12 +236,18 @@ Defaults to `http://localhost:3000`. Override the API host with `NEXT_PUBLIC_API
 
 ### 4.6 Testing
 
-There is **no automated test suite**. There is no `pytest` setup, no jest/vitest. Verification is currently done by:
+There is a small **unittest** suite under `backend/tests/` (no pytest, no jest/vitest). Current tests are DB-free — they cover the backtester no-lookahead invariants, VIX lookahead, the trading calendar, close-time FX, and the VIX fetcher. Run them from `backend/`:
+
+```bash
+.venv/bin/python -m unittest discover -s tests -v
+```
+
+These are not exhaustive. Broader verification is still done by:
 - Running `make scan` / `make simulate` against real DB data and reading the printed summaries.
 - Running a single-config backtest (`make backtest-config CONFIG=…`) and checking the rich-formatted progress + `backtest_results` rows.
 - Manually exercising the dashboard against a populated DB.
 
-If you add tests, do it under `backend/tests/` with pytest and let the user know — there is no existing convention to match.
+If you add tests, put them under `backend/tests/` using `unittest` to match the existing convention.
 
 ---
 
@@ -359,6 +365,8 @@ Consequences:
 - **Don't fork strategy logic** between live and backtest. If you need backtest-only behavior, put it in `portfolio_runner.py` or in config flags consumed by both sides.
 - **Fill at Open, value at Close** — matches `run_morning` exactly. No look-ahead bias.
 - **Data loaded once per config** (full date range), then sliced per window. Be careful when adding new data sources — load them upfront in `load_*` and pass via the `preloaded` dict for parallel workers.
+
+**Known exit-logic divergence (intentional, documented — not yet reconciled):** the live path has *two* exit stages — `position_manager.check_positions` (SL / TP / trailing / RSI-reversal / death-cross / time-exit) **and then** `executor.execute_signals`, whose SELL branch closes a held position on **any** generic SELL signal from **any** strategy. The backtester (`portfolio_runner.run_window`) only replicates the `position_manager` exits (SL/TP at Open, RSI-reversal, death-cross, time-exit) — it does **not** act on generic SELL signals. So live can close a position that the backtester would keep (e.g. a `sector_rotation` SELL closing an `rsi` position). This is a real live↔backtest gap in the exit layer; if you touch either engine's exits, decide deliberately whether to close it.
 
 ### 6.8 Allocation configs
 

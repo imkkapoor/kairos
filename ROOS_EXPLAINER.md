@@ -153,7 +153,7 @@ By default, `make backtest` runs **both** capital modes for every config. Use th
 
 ```bash
 make backtest                                                              # both modes
-make backtest-config CONFIG=adaptive_shield_v1                             # both modes, one config
+make backtest-config CONFIG=vol_recovery_v1                                # both modes, one config
 python -m backtesting.run_backtest --capital-mode capital_refresh           # refresh only
 python -m backtesting.run_backtest --capital-mode capital_compounded        # compounded only
 ```
@@ -164,7 +164,7 @@ Each capital_mode × config combination gets its own `run_id` and is stored with
 
 ## Sample Trade Walk-Through — W3 (COVID Crash, Jan–Jul 2020)
 
-Window 3 is the most instructive because it contains the sharpest drawdown in the dataset. Here is a hypothetical trace through a few key days for config `vol_filtered_regime_adaptive`.
+Window 3 is the most instructive because it contains the sharpest drawdown in the dataset. Here is a hypothetical trace through a few key days for config `vol_regime_adaptive`.
 
 ### Day 1 — 2020-01-09 (Thursday, market open)
 
@@ -285,7 +285,7 @@ These metrics are stored in `backtest_results` for this window. In `capital_refr
 
 ## Soft Circuit Breaker — Detailed Mechanics
 
-One of the most important risk overlays is the **soft CB** (Phase 4.8), used by configs like `vol_adaptive_soft_cb`, `vol_adaptive_full_v2`, and `vol_adaptive_conservative_v2`.
+One of the most important risk overlays is the **soft CB** (Phase 4.8), used by configs like `vol_soft_cb`, `vol_soft_cb_full`, and `vol_conservative_full`.
 
 ```
 cb_soft_start = 0.05   ← drawdown at which position sizing starts shrinking
@@ -451,7 +451,7 @@ flowchart TD
 
 Run a single config with:
 ```bash
-make backtest-config CONFIG=adaptive_shield_v1
+make backtest-config CONFIG=vol_recovery_v1
 ```
 
 Run all configs:

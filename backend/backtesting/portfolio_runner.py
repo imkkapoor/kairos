@@ -438,8 +438,15 @@ def run_window(
                 last_known_close[t] = p
 
         # ── 2. FX rate for today ─────────────────────────────────────────
+        # fx_rates is indexed at UTC midnight (load_fx_rates normalises + reindexes
+        # to a daily calendar), but day_ts carries the price bar's market time
+        # (ET-midnight → 04:00/05:00 UTC), so a direct lookup keyed on day_ts ALWAYS
+        # misses and would fall back to the last (future) rate — a lookahead bug.
+        # Key on the calendar date at UTC midnight and use .asof() to take the most
+        # recent rate at or before today (never a future rate).
         if fx_rates is not None:
-            fx_today = float(fx_rates.get(day_ts, fx_rates.iloc[-1]))
+            _fx_val = fx_rates.asof(pd.Timestamp(day_date, tz="UTC"))
+            fx_today = float(_fx_val) if pd.notna(_fx_val) else float(fx_rates.iloc[0])
         else:
             fx_today = 1.0
 
@@ -1000,7 +1007,13 @@ def run_window(
         for t, p in last_known_close.items():
             if t not in last_close:
                 last_close[t] = p
-        final_fx = float(fx_rates.iloc[-1]) if fx_rates is not None else 1.0
+        # Use the FX rate as-of the last trading day (not iloc[-1], which for a
+        # non-final ROOS window would be a future rate from later in the range).
+        if fx_rates is not None:
+            _ffx = fx_rates.asof(pd.Timestamp(last_day_ts.date(), tz="UTC"))
+            final_fx = float(_ffx) if pd.notna(_ffx) else float(fx_rates.iloc[0])
+        else:
+            final_fx = 1.0
         for ticker in list(portfolio.positions.keys()):
             ep = last_close.get(ticker, 0.0)
             if ep > 0:
