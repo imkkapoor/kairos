@@ -268,13 +268,30 @@ class Portfolio:
             f"SL=${stop_loss:.2f} TP=${take_profit:.2f} [{strategy}]"
         )
 
-    def close_position(self, ticker: str, exit_price: float) -> float:
-        """Close a position. Returns realised P&L in base currency. Adds proceeds back to cash."""
+    def close_position(
+        self,
+        ticker: str,
+        exit_price: float,
+        fx_rate: float | None = None,
+    ) -> float:
+        """Close a position. Returns realised P&L in base currency.
+
+        The ``fx_rate`` parameter is the CURRENT FX rate for the position's
+        native currency → portfolio base. It must be supplied by callers that
+        run in a multi-currency portfolio so that realised P&L and the cash
+        credit include FX moves between open and close. Falling back to the
+        stored open-time rate silently discards FX P&L (see AUDIT.md [C1]).
+
+        For USD-only portfolios (or CAD-native positions in a CAD-base portfolio)
+        the caller can pass ``fx_rate=1.0`` — or omit the argument, in which
+        case the open-time rate is used. Omission is preserved for backwards
+        compatibility only; new code should always pass the current rate.
+        """
         if ticker not in self.positions:
             logger.warning(f"close_position: {ticker} not in positions — ignoring")
             return 0.0
         pos = self.positions.pop(ticker)
-        fx = pos.get("fx_rate", 1.0)
+        fx = fx_rate if fx_rate is not None else pos.get("fx_rate", 1.0)
         realised_pnl = (exit_price - pos["avg_cost"]) * pos["qty"] * fx
         self.cash += exit_price * pos["qty"] * fx
         logger.debug(

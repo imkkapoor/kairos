@@ -61,9 +61,12 @@ def fetch_and_store_vix(start_date: str = "2017-01-02") -> None:
     df.index.name = "time"
     df.name = "close"
 
-    # Ensure UTC-aware DatetimeIndex
+    # Normalise to UTC-aware index using the same contract as data/fetcher.py:
+    # naive vendor timestamps for US equity / index daily bars are
+    # America/New_York, not UTC. Treating them as UTC silently shifts every
+    # bar by 4-5 hours.
     if df.index.tz is None:
-        df.index = df.index.tz_localize("UTC")
+        df.index = df.index.tz_localize("America/New_York").tz_convert("UTC")
     else:
         df.index = df.index.tz_convert("UTC")
 
