@@ -1,36 +1,87 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Kairos Dashboard
 
-## Getting Started
+Next.js 15 frontend for the Kairos algorithmic paper trading system.
 
-First, run the development server:
+## Dev server
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+make dashboard          # from repo root (runs pnpm install + pnpm dev)
+# or directly:
+cd dashboard && pnpm dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Opens at **http://localhost:3000**. Requires the FastAPI backend (`make api`) and TimescaleDB (`make up`) to be running.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+---
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## Pages
 
-## Learn More
+| Route | Description |
+|-------|-------------|
+| `/` | Live portfolio — equity value, open positions, PnL stats |
+| `/trades` | Trade log with entry/exit details, strategy, fill price |
+| `/backtest` | ROOS backtest run list — all configs and windows |
+| `/backtest/[runId]` | Backtest run detail — equity curve, per-window metrics, vol filter stats |
 
-To learn more about Next.js, take a look at the following resources:
+---
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## Backend API
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+All data comes from the FastAPI server at `http://localhost:8000`.
 
-## Deploy on Vercel
+```
+GET /api/dashboard                     Portfolio snapshot + live market metrics (^GSPC, CL=F, CAD=X, ^VIX)
+GET /api/trades                        Trade history (up to 10k, newest first)
+GET /api/backtest?config=&run_id=      ROOS results { runs, summary, run_list }
+GET /api/backtest/runs                 One row per run_id
+GET /api/backtest/analytics?run_id=    Pre-computed chart payloads (equity/drawdown/heatmap)
+GET /api/backtest/vix?run_id=          VIX series aligned to a backtest window
+GET /api/ticker/{ticker}?range=        OHLCV bars + per-ticker trade overlay
+```
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+See `backend/api/api.py` for full route definitions.
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+---
+
+## Tech stack
+
+| Layer | Technology |
+|-------|------------|
+| Framework | Next.js 15 (App Router) |
+| Styling | Tailwind CSS |
+| Components | shadcn/ui |
+| Charts | Recharts |
+| Data fetching | TanStack Query (React Query) |
+| Package manager | pnpm |
+
+---
+
+## Project structure
+
+```
+dashboard/
+├── app/
+│   ├── page.tsx                ← Portfolio overview
+│   ├── trades/page.tsx         ← Trade log
+│   └── backtest/
+│       ├── page.tsx            ← Backtest run list
+│       └── [runId]/page.tsx    ← Run detail
+├── components/
+│   ├── app-sidebar.tsx
+│   ├── providers.tsx
+│   └── ui/                     ← shadcn/ui primitives
+├── features/
+│   ├── backtest/               ← Backtest list + detail views
+│   ├── metrics/                ← Portfolio metric cards
+│   ├── portfolio/              ← Equity chart + stats
+│   ├── positions/              ← Open positions table + drawer
+│   └── trades/                 ← Trade history table
+├── lib/
+│   ├── api/
+│   │   ├── client.ts           ← Axios instance
+│   │   └── queries.ts          ← TanStack Query hooks
+│   └── types/api.ts            ← Shared API response types
+└── hooks/
+    └── use-mobile.ts
+```
+

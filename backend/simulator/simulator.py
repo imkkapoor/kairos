@@ -15,7 +15,8 @@ TWO daily jobs (scheduled via scheduler.py):
 THIS IS THE ONLY FILE in simulator/ that calls DB write functions.
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
+from typing import Optional
 from zoneinfo import ZoneInfo
 
 from loguru import logger
@@ -36,34 +37,56 @@ from db.connection import (
 from simulator.portfolio import Portfolio
 from simulator import executor
 from simulator import position_manager
+from utils.trading_calendar import prev_trading_day
 
 _ET = ZoneInfo("America/New_York")
 
 
 def _last_scan_date_utc() -> datetime:
-    """Return midnight UTC for the most recent weekday in ET.
+    """Return midnight UTC for the most recent NYSE trading day in ET.
 
     The scanner runs at 5:15 PM ET. At 9:31 AM ET the next morning, its
     signals sit in the *previous* ET calendar day's UTC window (signals are
     written ~21-22 UTC, run_morning fires ~13-14 UTC the next day).
-    Walking back to the last weekday also handles Monday mornings correctly
-    (scanner last ran Friday, not yesterday).
+    Uses `prev_trading_day` so holiday-Mondays (e.g. the Monday after Good
+    Friday) correctly walk back to the prior Thursday rather than returning
+    a non-trading Friday.
     """
-    now_et = datetime.now(_ET)
-    days_back = 1
-    while True:
-        candidate = (now_et - timedelta(days=days_back)).date()
-        if candidate.weekday() < 5:   # Mon=0 … Fri=4
-            break
-        days_back += 1
-    return datetime(candidate.year, candidate.month, candidate.day, tzinfo=timezone.utc)
+    today_et = datetime.now(_ET).date()
+    d = prev_trading_day(today_et)
+    return datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
 
 
-def run_morning() -> None:
-    """9:31 AM ET — fetch live prices in one batch, execute last night's signals."""
-    now = datetime.now(timezone.utc)
-    now_str = now.strftime("%Y-%m-%d")
-    logger.info(f"=== Kairos morning execution starting for {now_str} ===")
+def _prev_weekday_utc(from_date: datetime) -> datetime:
+    """Return midnight UTC of the most recent NYSE trading day before from_date.
+
+    Used in historical replay: morning execution for date D needs signals
+    written by the scanner that ran on the previous trading day. Holidays
+    are skipped, not just weekends.
+    """
+    d = prev_trading_day(from_date.date())
+    return datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
+
+
+def run_morning(for_date: Optional[datetime] = None) -> None:
+    """9:31 AM ET — fetch live prices in one batch, execute last night's signals.
+
+    Parameters
+    ----------
+    for_date:
+        When set, replay morning execution for this historical date using DB
+        prices instead of live prices. Signals are loaded from the previous
+        trading day's scan.
+    """
+    historical = for_date is not None
+    if historical:
+        now = for_date.replace(tzinfo=timezone.utc) if for_date.tzinfo is None else for_date
+        now_str = now.strftime("%Y-%m-%d")
+        logger.info(f"=== Kairos morning execution (historical replay) for {now_str} ===")
+    else:
+        now = datetime.now(timezone.utc)
+        now_str = now.strftime("%Y-%m-%d")
+        logger.info(f"=== Kairos morning execution starting for {now_str} ===")
 
     # ------------------------------------------------------------------
     # 1. Load portfolio
@@ -75,40 +98,54 @@ def run_morning() -> None:
     #    Signals are written at ~17:15 ET (21-22 UTC) by the previous
     #    evening's scanner, so they live in yesterday's UTC date window.
     # ------------------------------------------------------------------
-    scan_date = _last_scan_date_utc()
+    if historical:
+        scan_date = _prev_weekday_utc(now)
+    else:
+        scan_date = _last_scan_date_utc()
     logger.info(f"run_morning: loading signals for scan date {scan_date.date()} UTC")
     signals_df = get_todays_signals(for_date=scan_date)
-    if signals_df.empty:
-        logger.info("run_morning: No signals to execute")
+    if signals_df.empty and not portfolio.positions:
+        logger.info("run_morning: No signals to execute and no open positions")
         print(f"-- Kairos morning execution -- {now_str} 09:31 ET --")
         print("No signals to execute.")
         print("------------------------------------------")
         return
 
-    todays_signals: list[dict] = signals_df.to_dict("records")
+    todays_signals: list[dict] = [] if signals_df.empty else signals_df.to_dict("records")
     todays_signals.sort(
         key=lambda s: float(s.get("z_score") if s.get("z_score") is not None else s.get("strength", 0.0)),
         reverse=True,
     )
 
     # ------------------------------------------------------------------
-    # 3. Fetch live prices in ONE batch for signals + open positions
+    # 3. Fetch prices in ONE batch for signals + open positions
+    #    Live mode: yfinance real-time prices.
+    #    Historical mode: most recent DB close on or before for_date.
     # ------------------------------------------------------------------
     signal_tickers: set[str] = {s["ticker"] for s in todays_signals if s.get("ticker")}
     position_tickers: set[str] = set(portfolio.positions.keys())
     tickers_needed: list[str] = list(signal_tickers | position_tickers)
 
-    logger.info(f"run_morning: fetching live prices for {len(tickers_needed)} tickers")
-    current_prices = executor.fetch_live_prices(tickers_needed)
+    if historical:
+        logger.info(f"run_morning: using DB close prices for {now_str} ({len(tickers_needed)} tickers)")
+        current_prices = get_latest_close_prices(tickers_needed, for_date=now)
+    else:
+        logger.info(f"run_morning: fetching live prices for {len(tickers_needed)} tickers")
+        current_prices = executor.fetch_live_prices(tickers_needed)
 
     # Pin all trade timestamps to 9:31 AM ET (same anchor as fill prices)
     # so manual runs and the scheduled job produce identical trade rows.
-    trade_time = executor._open_cutoff_utc()
+    if historical:
+        trade_time = now.astimezone(_ET).replace(
+            hour=9, minute=31, second=0, microsecond=0
+        ).astimezone(timezone.utc)
+    else:
+        trade_time = executor._open_cutoff_utc()
 
     # ------------------------------------------------------------------
     # 4. Load today's indicators (written last night by scanner)
     # ------------------------------------------------------------------
-    today_indicators = get_latest_indicators(tickers_needed) if tickers_needed else {}
+    today_indicators = get_latest_indicators(tickers_needed, for_date=now) if tickers_needed else {}
 
     # ------------------------------------------------------------------
     # 5. Fetch sector map + market map + FX rates
@@ -126,10 +163,19 @@ def run_morning() -> None:
             pair = f"{ccy}{portfolio_ccy}"
             rate = get_fx_rate(pair, since=today_start_utc)
             if rate is None:
-                # Not yet in DB for today — fetch live once and persist
-                rate = executor.fetch_fx_rate(ccy, portfolio_ccy)
-                if rate is not None:
-                    insert_fx_rate(pair, rate)
+                if historical:
+                    # Historical mode: look up the closest stored rate on or before for_date
+                    rate = get_fx_rate(pair, at_time=now)
+                    if rate is None:
+                        logger.warning(
+                            f"run_morning: no stored {ccy}→{portfolio_ccy} rate for "
+                            f"{now_str} — using 1.0"
+                        )
+                else:
+                    # Live mode: fetch live once and persist
+                    rate = executor.fetch_fx_rate(ccy, portfolio_ccy)
+                    if rate is not None:
+                        insert_fx_rate(pair, rate)
             if rate is not None:
                 fx_rates[ccy] = rate
             else:
@@ -138,7 +184,42 @@ def run_morning() -> None:
     logger.info(f"run_morning: FX rates ({portfolio_ccy} base): {fx_rates}")
 
     # ------------------------------------------------------------------
-    # 6. Execute new signals (buy/sell) — no position management here
+    # 6. Position management at open: check SL/TP/trailing stops on existing
+    #    positions BEFORE executing new signals, so freed cash is immediately
+    #    available for new buys and exposure is correctly measured.
+    # ------------------------------------------------------------------
+    summary_pre_open_closed: list[dict] = []
+    pre_open_trailing_updates: list[dict] = []
+    if portfolio.positions:
+        close_actions, trailing_stop_updates = position_manager.check_positions(
+            portfolio, current_prices, today_indicators, todays_signals, as_of=now
+        )
+        for action in close_actions:
+            pos_ccy = portfolio.positions.get(action["ticker"], {}).get("currency", "USD")
+            pos_fx  = fx_rates.get(pos_ccy, 1.0)
+            pnl = portfolio.close_position(action["ticker"], action["exit_price"], fx_rate=pos_fx)
+            close_trade(action["ticker"], action["exit_price"], action["reason"], trade_time=trade_time)
+            summary_pre_open_closed.append({
+                "ticker":     action["ticker"],
+                "exit_price": action["exit_price"],
+                "reason":     action["reason"],
+                "pnl":        pnl,
+            })
+            logger.info(
+                f"run_morning [pre-open exit] {action['ticker']} @ ${action['exit_price']:.2f}  "
+                f"P&L: {'+' if pnl >= 0 else ''}${pnl:,.2f}  {action['reason']}"
+            )
+        pre_open_trailing_updates = trailing_stop_updates
+        for item in pre_open_trailing_updates:
+            update_stop_loss(item["ticker"], item["new_stop_loss"])
+        if close_actions or trailing_stop_updates:
+            logger.info(
+                f"run_morning: pre-open management — closed={len(close_actions)}, "
+                f"trailing_updates={len(trailing_stop_updates)}"
+            )
+
+    # ------------------------------------------------------------------
+    # 7. Execute new signals (buy/sell) — runs after pre-open management
     # ------------------------------------------------------------------
     already_held = set(portfolio.positions.keys())
     eligible_signals = [
@@ -204,6 +285,16 @@ def run_morning() -> None:
 
     print()
     print(f"-- Kairos morning execution -- {now_str} 09:31 ET --")
+    if summary_pre_open_closed:
+        print(f"Pre-open exits ({len(summary_pre_open_closed)}):")
+        for t in summary_pre_open_closed:
+            pnl_val = t['pnl']
+            pnl_str = f"{'+' if pnl_val >= 0 else ''}${pnl_val:,.2f}"
+            print(f"  {t['ticker']:8s} SELL @ ${t['exit_price']:.2f}  P&L: {pnl_str}  {t['reason']}")
+    if pre_open_trailing_updates:
+        print(f"Pre-open trailing stops updated ({len(pre_open_trailing_updates)}):")
+        for u in pre_open_trailing_updates:
+            print(f"  {u['ticker']:8s} new SL: ${u['new_stop_loss']:.2f}")
     print(f"Opened today ({len(summary_opened)}):")
     if summary_opened:
         for t in summary_opened:
@@ -233,15 +324,29 @@ def run_morning() -> None:
             print(f"FX rates: {', '.join(fx_parts)}")
     print("------------------------------------------")
     logger.info(
-        f"run_morning complete: opened={len(summary_opened)}, skipped={len(skipped)}"
+        f"run_morning complete: pre_open_closed={len(summary_pre_open_closed)}, "
+        f"opened={len(summary_opened)}, skipped={len(skipped)}"
     )
 
 
-def run_evening() -> None:
-    """5:25 PM ET — check stops/take-profits using today's close prices from DB."""
-    now = datetime.now(timezone.utc)
-    now_str = now.strftime("%Y-%m-%d")
-    logger.info(f"=== Kairos evening management starting for {now_str} ===")
+def run_evening(for_date: Optional[datetime] = None) -> None:
+    """5:25 PM ET — check stops/take-profits using today's close prices from DB.
+
+    Parameters
+    ----------
+    for_date:
+        When set, replay evening management for this historical date using DB
+        close prices for that date.
+    """
+    historical = for_date is not None
+    if historical:
+        now = for_date.replace(tzinfo=timezone.utc) if for_date.tzinfo is None else for_date
+        now_str = now.strftime("%Y-%m-%d")
+        logger.info(f"=== Kairos evening management (historical replay) for {now_str} ===")
+    else:
+        now = datetime.now(timezone.utc)
+        now_str = now.strftime("%Y-%m-%d")
+        logger.info(f"=== Kairos evening management starting for {now_str} ===")
 
     # ------------------------------------------------------------------
     # 1. Load portfolio
@@ -256,10 +361,13 @@ def run_evening() -> None:
         return
 
     # ------------------------------------------------------------------
-    # 2. Fetch today's closing prices from price_data DB (no yfinance call)
+    # 2. Fetch closing prices from price_data DB (no yfinance call)
+    #    Historical mode: most recent close on or before for_date.
     # ------------------------------------------------------------------
     position_tickers = list(portfolio.positions.keys())
-    closing_prices = get_latest_close_prices(position_tickers)
+    closing_prices = get_latest_close_prices(
+        position_tickers, for_date=now if historical else None
+    )
 
     missing = [t for t in position_tickers if t not in closing_prices]
     if missing:
@@ -278,10 +386,18 @@ def run_evening() -> None:
             pair = f"{ccy}{portfolio_ccy}"
             rate = get_fx_rate(pair, since=today_start_utc)
             if rate is None:
-                # Not in DB for today — fetch live once and persist
-                rate = executor.fetch_fx_rate(ccy, portfolio_ccy)
-                if rate is not None:
-                    insert_fx_rate(pair, rate)
+                if historical:
+                    rate = get_fx_rate(pair, at_time=now)
+                    if rate is None:
+                        logger.warning(
+                            f"run_evening: no stored {ccy}→{portfolio_ccy} rate for "
+                            f"{now_str} — using 1.0"
+                        )
+                else:
+                    # Not in DB for today — fetch live once and persist
+                    rate = executor.fetch_fx_rate(ccy, portfolio_ccy)
+                    if rate is not None:
+                        insert_fx_rate(pair, rate)
             if rate is not None:
                 fx_rates[ccy] = rate
             else:
@@ -292,7 +408,7 @@ def run_evening() -> None:
     # ------------------------------------------------------------------
     # 3. Load indicators and today's signals
     # ------------------------------------------------------------------
-    today_indicators = get_latest_indicators(position_tickers) if position_tickers else {}
+    today_indicators = get_latest_indicators(position_tickers, for_date=now if historical else None) if position_tickers else {}
     signals_df = get_todays_signals(for_date=now)
     todays_signals: list[dict] = [] if signals_df.empty else signals_df.to_dict("records")
 
@@ -300,7 +416,7 @@ def run_evening() -> None:
     # 4. Position management: close exits + trailing stop updates
     # ------------------------------------------------------------------
     close_actions, trailing_stop_updates = position_manager.check_positions(
-        portfolio, closing_prices, today_indicators, todays_signals
+        portfolio, closing_prices, today_indicators, todays_signals, as_of=now
     )
 
     summary_closed: list[dict] = []
@@ -308,7 +424,9 @@ def run_evening() -> None:
         ticker     = action["ticker"]
         exit_price = action["exit_price"]
         reason     = action["reason"]
-        pnl = portfolio.close_position(ticker, exit_price)
+        pos_ccy    = portfolio.positions.get(ticker, {}).get("currency", "USD")
+        pos_fx     = fx_rates.get(pos_ccy, 1.0)
+        pnl = portfolio.close_position(ticker, exit_price, fx_rate=pos_fx)
         close_trade(ticker, exit_price, reason)
         summary_closed.append({
             "ticker":     ticker,
@@ -439,7 +557,7 @@ def run_intraday() -> None:
     # 5. Check positions for exits / trailing stop updates
     # ------------------------------------------------------------------
     close_actions, trailing_stop_updates = position_manager.check_positions(
-        portfolio, current_prices, today_indicators, todays_signals
+        portfolio, current_prices, today_indicators, todays_signals, as_of=now
     )
 
     summary_closed: list[dict] = []
@@ -447,7 +565,9 @@ def run_intraday() -> None:
         ticker     = action["ticker"]
         exit_price = action["exit_price"]
         reason     = action["reason"]
-        pnl = portfolio.close_position(ticker, exit_price)
+        pos_ccy    = portfolio.positions.get(ticker, {}).get("currency", "USD")
+        pos_fx     = fx_rates.get(pos_ccy, 1.0)
+        pnl = portfolio.close_position(ticker, exit_price, fx_rate=pos_fx)
         close_trade(ticker, exit_price, reason)
         summary_closed.append({
             "ticker":     ticker,
@@ -477,13 +597,36 @@ def run_intraday() -> None:
 
 
 if __name__ == "__main__":
-    """CLI entry point: python -m simulator.simulator [morning|evening]
-    Defaults to 'morning'. Signals are always loaded from the most recent
-    weekday scan via _last_scan_date_utc().
+    """CLI entry point: python -m simulator.simulator [morning|evening] [--date YYYY-MM-DD]
+
+    Defaults to 'morning'. Without --date, uses live prices and the most recent
+    weekday's signals. With --date, replays execution for that historical date
+    using DB prices/signals — useful for catching up after missed days.
     """
     import sys
-    mode = sys.argv[1].lower() if len(sys.argv) > 1 else "morning"
-    if mode == "evening":
-        run_evening()
+
+    _mode = "morning"
+    _for_date = None
+    _args = sys.argv[1:]
+    _i = 0
+    while _i < len(_args):
+        if _args[_i] in ("morning", "evening"):
+            _mode = _args[_i]
+            _i += 1
+        elif _args[_i] == "--date" and _i + 1 < len(_args):
+            _for_date = datetime.strptime(_args[_i + 1], "%Y-%m-%d").replace(
+                tzinfo=timezone.utc
+            )
+            _i += 2
+        elif _args[_i].startswith("--date="):
+            _for_date = datetime.strptime(
+                _args[_i].split("=", 1)[1], "%Y-%m-%d"
+            ).replace(tzinfo=timezone.utc)
+            _i += 1
+        else:
+            _i += 1
+
+    if _mode == "evening":
+        run_evening(for_date=_for_date)
     else:
-        run_morning()
+        run_morning(for_date=_for_date)

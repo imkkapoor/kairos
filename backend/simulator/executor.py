@@ -72,6 +72,7 @@ def fetch_live_prices(tickers: list[str]) -> dict[str, float]:
 
     result: dict[str, float] = {}
     try:
+        logger.debug(f"fetch_live_prices: → yfinance 1m period=1d ({len(tickers)} tickers)")
         df = yf.download(
             tickers,
             period="1d",
@@ -82,6 +83,7 @@ def fetch_live_prices(tickers: list[str]) -> dict[str, float]:
         if df is None or df.empty:
             logger.warning("fetch_live_prices: yfinance returned empty DataFrame")
             return {}
+        logger.debug(f"fetch_live_prices: ← yfinance {len(df)} bars, {df.shape[1]} cols")
 
         # Normalise index to UTC
         if df.index.tz is None:
@@ -147,6 +149,7 @@ def fetch_current_prices(tickers: list[str]) -> dict[str, float]:
 
     result: dict[str, float] = {}
     try:
+        logger.debug(f"fetch_current_prices: → yfinance 1m period=1d ({len(tickers)} tickers)")
         df = yf.download(
             tickers,
             period="1d",
@@ -157,6 +160,7 @@ def fetch_current_prices(tickers: list[str]) -> dict[str, float]:
         if df is None or df.empty:
             logger.warning("fetch_current_prices: yfinance returned empty DataFrame")
             return {}
+        logger.debug(f"fetch_current_prices: ← yfinance {len(df)} bars, {df.shape[1]} cols")
 
         if df.index.tz is None:
             df.index = df.index.tz_localize("America/New_York").tz_convert("UTC")
@@ -497,7 +501,7 @@ def execute_signals(
             original_qty      = portfolio.positions[ticker]["qty"]
             sell_ccy  = portfolio.positions[ticker].get("currency", "USD")
             sell_fx   = fx_rates.get(sell_ccy, portfolio.positions[ticker].get("fx_rate", 1.0))
-            pnl = portfolio.close_position(ticker, fill_price)
+            pnl = portfolio.close_position(ticker, fill_price, fx_rate=sell_fx)
             trade = {
                 "ticker":          ticker,
                 "side":            "sell",

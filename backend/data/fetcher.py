@@ -175,18 +175,16 @@ def backfill(ticker: str, interval: str = "1d", years: int = 10) -> dict:
     start      = start_date.isoformat()
     end        = (today + timedelta(days=1)).isoformat()  # yfinance end is exclusive
 
-    logger.debug(f"[{ticker}] backfill {start} → {today} ({interval})")
-
     df = _fetch_with_retry(ticker, start=start, end=end, interval=interval)
     df = _normalise(df, ticker)
 
     if df.empty:
-        logger.warning(f"[{ticker}] empty DataFrame after fetch/normalise")
+        logger.warning(f"[fetcher] {ticker} | {interval} | no data")
         return {"status": "error", "rows": 0, "ticker": ticker}
 
     try:
         rows = insert_price_data(df, ticker, interval)
-        logger.debug(f"[{ticker}] backfill inserted {rows} rows")
+        logger.info(f"[fetcher] {ticker} | {interval} | {rows} bars")
         return {"status": "success", "rows": rows, "ticker": ticker}
     except Exception as exc:
         logger.error(f"[{ticker}] DB insert error during backfill: {exc}")
@@ -213,34 +211,29 @@ def update(ticker: str, interval: str = "1d") -> dict:
     """
     latest = get_latest_timestamp(ticker, interval)
     if latest is None:
-        logger.trace(f"[{ticker}] no existing data — running backfill")
         return backfill(ticker, interval)
 
     today      = datetime.now(timezone.utc).date()
     start_date = (latest + timedelta(days=1)).date()
 
     if start_date > today:
-        logger.trace(f"[{ticker}] already up-to-date (latest: {latest.date()})")
         return {"status": "skipped", "rows": 0, "ticker": ticker}
 
     start = start_date.isoformat()
     end   = (today + timedelta(days=1)).isoformat()  # yfinance end is exclusive
-
-    logger.trace(f"[{ticker}] update {start} → {today} ({interval})")
 
     df = _fetch_with_retry(ticker, start=start, end=end, interval=interval)
     df = _normalise(df, ticker)
 
     if df.empty:
         if start_date >= today:
-            logger.trace(f"[{ticker}] no new daily bar yet (market may still be open)")
             return {"status": "skipped", "rows": 0, "ticker": ticker}
-        logger.warning(f"[{ticker}] empty DataFrame after fetch/normalise")
+        logger.warning(f"[fetcher] {ticker} | {interval} | no data")
         return {"status": "error", "rows": 0, "ticker": ticker}
 
     try:
         rows = insert_price_data(df, ticker, interval)
-        logger.trace(f"[{ticker}] update inserted {rows} rows")
+        logger.info(f"[fetcher] {ticker} | {interval} | {rows} bars")
         return {"status": "success", "rows": rows, "ticker": ticker}
     except Exception as exc:
         logger.error(f"[{ticker}] DB insert error during update: {exc}")
@@ -258,7 +251,7 @@ def backfill_all(interval: str = "1d", years: int = 10) -> None:
         Years of history to fetch per ticker (default 5).
     """
     tickers = get_watchlist(active_only=True)
-    logger.info(f"Starting backfill for {len(tickers)} tickers ({years}yr, {interval})")
+    logger.info(f"[fetcher] backfill_all: {len(tickers)} tickers ({years}yr, {interval})")
 
     t_start   = _time.monotonic()
     n_success = n_skipped = n_failed = n_rows = 0
@@ -295,8 +288,7 @@ def backfill_all(interval: str = "1d", years: int = 10) -> None:
                 _time.sleep(_RATE_DELAY)
                 progress.advance(task)
     else:
-        for i, ticker in enumerate(tickers, 1):
-            logger.info(f"[{i}/{len(tickers)}] {ticker}")
+        for ticker in tickers:
             _run(ticker)
             _time.sleep(_RATE_DELAY)
 
@@ -311,8 +303,8 @@ def backfill_all(interval: str = "1d", years: int = 10) -> None:
         duration_secs   = round(duration, 2),
     )
     logger.info(
-        f"backfill_all complete — {n_success} ok, {n_skipped} skipped, "
-        f"{n_failed} failed, {n_rows} rows inserted in {duration:.1f}s"
+        f"[fetcher] backfill_all done — {n_success} ok, {n_skipped} skipped, "
+        f"{n_failed} failed, {n_rows} rows in {duration:.1f}s"
     )
 
 
@@ -330,7 +322,7 @@ def update_all(interval: str = "1d") -> int:
         Total number of rows inserted across all tickers.
     """
     tickers = get_watchlist(active_only=True)
-    logger.info(f"Incremental update for {len(tickers)} tickers ({interval})")
+    logger.info(f"[fetcher] update_all: {len(tickers)} tickers ({interval})")
 
     t_start   = _time.monotonic()
     n_success = n_skipped = n_failed = n_rows = 0
@@ -367,8 +359,7 @@ def update_all(interval: str = "1d") -> int:
                 _time.sleep(_RATE_DELAY)
                 progress.advance(task)
     else:
-        for i, ticker in enumerate(tickers, 1):
-            logger.info(f"[{i}/{len(tickers)}] {ticker}")
+        for ticker in tickers:
             _run_update(ticker)
             _time.sleep(_RATE_DELAY)
 
@@ -383,8 +374,8 @@ def update_all(interval: str = "1d") -> int:
         duration_secs   = round(duration, 2),
     )
     logger.info(
-        f"update_all complete — {n_success} ok, {n_skipped} skipped, "
-        f"{n_failed} failed, {n_rows} rows inserted in {duration:.1f}s"
+        f"[fetcher] update_all done — {n_success} ok, {n_skipped} skipped, "
+        f"{n_failed} failed, {n_rows} rows in {duration:.1f}s"
     )
     return n_rows
 

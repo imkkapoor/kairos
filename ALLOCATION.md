@@ -2,6 +2,10 @@
 
 This document describes exactly how signal **strength** is computed for each strategy, how **z-scores** normalise those strengths across the daily universe, and how **position size** is determined at execution time.
 
+> **Backtest variant:** See `BACKTEST_ALLOCATION.md` for the same logic plus the
+> **Phase 4.5 VIX volatility regime filter** (`use_vol_filter`). The live
+> executor does not yet use `vol_regime.py` — that wiring is a future phase.
+
 ---
 
 ## 1. Indicators Computed Nightly

@@ -19,6 +19,7 @@ import math
 import os
 import sys
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 import pandas as pd
 import pandas_ta as ta
@@ -184,7 +185,10 @@ def _compute_row(df: pd.DataFrame, ticker: str) -> dict | None:
 # Public API
 # ---------------------------------------------------------------------------
 
-def compute_all(interval: str = "1d") -> dict[str, dict]:
+def compute_all(
+    interval: str = "1d",
+    for_date: Optional[datetime] = None,
+) -> dict[str, dict]:
     """Compute and persist today's indicators for all active watchlist tickers.
 
     Returns {ticker: row_dict} where each row_dict contains all DB columns plus
@@ -198,19 +202,35 @@ def compute_all(interval: str = "1d") -> dict[str, dict]:
     Skip conditions (logged as WARNING, no crash):
       - Fewer than 200 bars of price data (insufficient for MA-200)
       - Any required indicator evaluates to NaN after computation
+
+    Parameters
+    ----------
+    for_date:
+        When set, compute indicators using price data up to and including this
+        date (historical replay). Defaults to the most recent bar (live mode).
     """
     tickers = get_watchlist(active_only=True)
 
-    # Determine the latest trading day from actual price data so the cache
-    # lookup matches indicator timestamps (which inherit the price bar time,
-    # e.g. 2026-03-25 04:00 UTC) rather than today's UTC calendar date.
-    _latest_bar_time = None
-    try:
-        _spy_bar = get_price_data("SPY", interval=interval, limit=1)
-        if not _spy_bar.empty:
-            _latest_bar_time = _spy_bar.index[-1]  # UTC-aware pd.Timestamp
-    except Exception:
-        pass
+    if for_date is not None:
+        # Historical mode: pin data window to for_date
+        _latest_bar_time = for_date.replace(hour=0, minute=0, second=0, microsecond=0)
+        if _latest_bar_time.tzinfo is None:
+            _latest_bar_time = _latest_bar_time.replace(tzinfo=timezone.utc)
+        end_dt = _latest_bar_time + timedelta(days=1)
+        start_dt = _latest_bar_time - timedelta(days=_FETCH_DAYS)
+    else:
+        # Live mode: determine the latest trading day from actual price data so
+        # the cache lookup matches indicator timestamps (which inherit the price
+        # bar time, e.g. 2026-03-25 04:00 UTC) rather than today's UTC date.
+        _latest_bar_time = None
+        try:
+            _spy_bar = get_price_data("SPY", interval=interval, limit=1)
+            if not _spy_bar.empty:
+                _latest_bar_time = _spy_bar.index[-1]  # UTC-aware pd.Timestamp
+        except Exception:
+            pass
+        end_dt = None
+        start_dt = datetime.now(timezone.utc) - timedelta(days=_FETCH_DAYS)
 
     existing_today = get_todays_indicators(
         tickers, interval=interval, for_date=_latest_bar_time,
@@ -229,14 +249,13 @@ def compute_all(interval: str = "1d") -> dict[str, dict]:
             results[ticker] = row
 
     # Compute fresh indicators for tickers not yet done today
-    start_dt   = datetime.now(timezone.utc) - timedelta(days=_FETCH_DAYS)
     computed   = 0
     skipped    = 0
 
     def _process_ticker(ticker: str) -> None:
         nonlocal computed, skipped
         try:
-            df = get_price_data(ticker, interval=interval, start=start_dt)
+            df = get_price_data(ticker, interval=interval, start=start_dt, end=end_dt)
             df = df.tail(250)
 
             if len(df) < _MIN_ROWS:

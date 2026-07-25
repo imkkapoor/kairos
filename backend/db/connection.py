@@ -284,6 +284,7 @@ def get_price_data(
     interval: str = "1d",
     limit: Optional[int] = None,
     start: Optional[datetime] = None,
+    end: Optional[datetime] = None,
 ) -> pd.DataFrame:
     """Return OHLCV data for a ticker as a UTC-indexed DataFrame.
 
@@ -297,6 +298,9 @@ def get_price_data(
         If set, return only the most recent N rows.
     start:
         If set, only return rows at or after this UTC-aware datetime.
+    end:
+        If set, only return rows strictly before this UTC-aware datetime.
+        Pass the start of the next day to include the full target day.
 
     Returns
     -------
@@ -312,6 +316,11 @@ def get_price_data(
         start = to_utc(start)
         conditions.append("time >= :start")
         params["start"] = start
+
+    if end is not None:
+        end = to_utc(end)
+        conditions.append("time < :end")
+        params["end"] = end
 
     where = " AND ".join(conditions)
     if limit:
@@ -697,7 +706,7 @@ def get_latest_price_bars(
 
 
 def get_latest_indicators(
-    tickers: list[str], interval: str = "1d"
+    tickers: list[str], interval: str = "1d", for_date: Optional[datetime] = None
 ) -> dict[str, dict]:
     """Return the most recent indicator row per ticker in a single query.
 
@@ -707,54 +716,79 @@ def get_latest_indicators(
     so date-filtered get_todays_indicators() would return nothing for the same
     calendar day the scan ran.
 
+    Parameters
+    ----------
+    for_date:
+        When set, only considers indicator rows strictly before the start of
+        the next day (i.e. rows on or before for_date). Use this for historical
+        replay so future data is not leaked.
+
     Returns {ticker: row_dict}. Absent tickers have no data in the DB.
     """
     if not tickers:
         return {}
 
     engine = get_engine()
+    conditions = "ticker = ANY(:tickers) AND interval = :interval"
+    params: dict = {"tickers": tickers, "interval": interval}
+    if for_date is not None:
+        end_utc = (to_utc(for_date) + timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        conditions += " AND time < :end"
+        params["end"] = end_utc
     query = text(
-        """
+        f"""
         SELECT DISTINCT ON (ticker) *
         FROM indicators
-        WHERE ticker = ANY(:tickers) AND interval = :interval
+        WHERE {conditions}
         ORDER BY ticker, time DESC
         """
     )
-    df = pd.read_sql(
-        query, engine, params={"tickers": tickers, "interval": interval}
-    )
+    df = pd.read_sql(query, engine, params=params)
     if df.empty:
         return {}
     return {row["ticker"]: row.to_dict() for _, row in df.iterrows()}
 
 
 def get_prev_indicators(
-    tickers: list[str], interval: str = "1d"
+    tickers: list[str], interval: str = "1d", for_date: Optional[datetime] = None
 ) -> dict[str, dict]:
     """Return the second most recent indicator row per ticker.
 
     Uses ROW_NUMBER() DESC so weekends and holidays are handled correctly —
     never assumes the previous row is exactly one calendar day back.
+
+    Parameters
+    ----------
+    for_date:
+        When set, only considers rows strictly before start of the next day
+        so historical replay does not leak future data.
     """
     if not tickers:
         return {}
 
     engine = get_engine()
+    conditions = "ticker = ANY(:tickers) AND interval = :interval"
+    params: dict = {"tickers": tickers, "interval": interval}
+    if for_date is not None:
+        end_utc = (to_utc(for_date) + timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        conditions += " AND time < :end"
+        params["end"] = end_utc
     query = text(
-        """
+        f"""
         WITH ranked AS (
             SELECT *,
                    ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY time DESC) AS rn
             FROM indicators
-            WHERE ticker = ANY(:tickers) AND interval = :interval
+            WHERE {conditions}
         )
         SELECT * FROM ranked WHERE rn = 2
         """
     )
-    df = pd.read_sql(
-        query, engine, params={"tickers": tickers, "interval": interval}
-    )
+    df = pd.read_sql(query, engine, params=params)
     if df.empty:
         return {}
     return {row["ticker"]: row.to_dict() for _, row in df.iterrows()}
@@ -971,13 +1005,19 @@ def close_trade(ticker: str, exit_price: float, exit_reason: str, trade_time: Op
 
     Actions (atomic):
       1. Find the most recent open buy trade for *ticker* (status='filled', side='buy').
-      2. Insert a sell trade row with the same quantity, strategy, currency and fx_rate.
+      2. Insert a sell trade row with the same quantity and strategy.
       3. Mark the original buy trade status='closed'.
+
+    Note: the trades table has no currency/fx_rate columns — per-trade FX is not
+    persisted here. Currency-aware realised P&L (base currency) is computed by
+    simulator.Portfolio.close_position and captured in portfolio_snapshots.
 
     Returns
     -------
     float
-        Realised P&L = (exit_price - original_fill_price) * quantity.
+        Informational realised P&L in the fill-price currency
+        = (exit_price - original_fill_price) * quantity. This is NOT currency-
+        converted; callers that need base-currency P&L use Portfolio.close_position.
         Returns 0.0 if no open buy trade is found.
     """
     now = trade_time if trade_time is not None else datetime.now(timezone.utc)
@@ -1099,58 +1139,6 @@ def get_trade_history(
     return df
 
 
-def get_portfolio_stats() -> dict:
-    """Return aggregate trade performance stats.
-
-    Returns
-    -------
-    dict with keys:
-        total_trades, winning_trades, win_rate, avg_win, avg_loss, total_pnl
-    """
-    engine = get_engine()
-    # Join buy and sell trades to compute per-trade PnL
-    query = text(
-        """
-        SELECT
-            buy.ticker,
-            buy.quantity,
-            buy.fill_price                         AS buy_price,
-            sell.fill_price                        AS sell_price,
-            (sell.fill_price - buy.fill_price) * buy.quantity AS pnl
-        FROM trades buy
-        JOIN trades sell
-          ON sell.ticker = buy.ticker
-         AND sell.side   = 'sell'
-         AND sell.strategy = buy.strategy
-        WHERE buy.side = 'buy'
-          AND buy.status = 'closed'
-        """
-    )
-    df = pd.read_sql(query, engine)
-
-    if df.empty:
-        return {
-            "total_trades":   0,
-            "winning_trades": 0,
-            "win_rate":       0.0,
-            "avg_win":        0.0,
-            "avg_loss":       0.0,
-            "total_pnl":      0.0,
-        }
-
-    total  = len(df)
-    wins   = df[df["pnl"] > 0]
-    losses = df[df["pnl"] <= 0]
-    return {
-        "total_trades":   total,
-        "winning_trades": len(wins),
-        "win_rate":       round(len(wins) / total, 4) if total > 0 else 0.0,
-        "avg_win":        round(wins["pnl"].mean(), 2) if not wins.empty else 0.0,
-        "avg_loss":       round(losses["pnl"].mean(), 2) if not losses.empty else 0.0,
-        "total_pnl":      round(df["pnl"].sum(), 2),
-    }
-
-
 def get_latest_atr(ticker: str) -> Optional[float]:
     """Return the most recent atr_14 value for a ticker from the indicators table.
 
@@ -1209,12 +1197,20 @@ def get_peak_portfolio_value() -> float:
     return float(val) if val is not None else initial
 
 
-def get_latest_close_prices(tickers: list[str]) -> dict[str, float]:
+def get_latest_close_prices(
+    tickers: list[str], for_date: Optional[datetime] = None
+) -> dict[str, float]:
     """Return the most recent closing price per ticker from price_data.
 
     Reads from the DB only — no yfinance call. The 5:00 PM data fetch writes
     today's close to price_data, so this is safe to call at 5:25 PM ET.
     Used by run_evening() so it never makes a live network request.
+
+    Parameters
+    ----------
+    for_date:
+        When set, returns the most recent close on or before this date
+        (strictly before start of the next day). Use for historical replay.
 
     Returns {ticker: close_price} for all requested tickers that have data.
     Tickers with no rows in price_data are simply absent from the result.
@@ -1223,14 +1219,370 @@ def get_latest_close_prices(tickers: list[str]) -> dict[str, float]:
         return {}
 
     engine = get_engine()
+    if for_date is not None:
+        end_utc = (to_utc(for_date) + timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        query = text(
+            """
+            SELECT DISTINCT ON (ticker) ticker, close
+            FROM price_data
+            WHERE ticker = ANY(:tickers) AND interval = '1d' AND time < :end
+            ORDER BY ticker, time DESC
+            """
+        )
+        with engine.connect() as conn:
+            rows = conn.execute(query, {"tickers": tickers, "end": end_utc}).fetchall()
+    else:
+        query = text(
+            """
+            SELECT DISTINCT ON (ticker) ticker, close
+            FROM price_data
+            WHERE ticker = ANY(:tickers)
+            ORDER BY ticker, time DESC
+            """
+        )
+        with engine.connect() as conn:
+            rows = conn.execute(query, {"tickers": tickers}).fetchall()
+    return {row[0]: float(row[1]) for row in rows}
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.5: VIX data
+# ---------------------------------------------------------------------------
+
+def insert_vix_data(rows: list[dict]) -> int:
+    """Bulk upsert VIX close rows into vix_data. Returns rows actually inserted.
+
+    Each dict must have 'time' (UTC-aware datetime) and 'close' (float).
+    Source defaults to 'yfinance'. ON CONFLICT DO NOTHING — safe to re-run.
+
+    Timezone contract: all vendor bars are treated as America/New_York when
+    naive (matching data/fetcher.py and data/fetch_vix.py). Callers must
+    convert to UTC before insertion so the index aligns with price_data and
+    fx_rates.
+    """
+    if not rows:
+        return 0
+
+    data = [
+        (
+            r["time"] if hasattr(r["time"], "tzinfo") else r["time"],
+            float(r["close"]),
+            r.get("source", "yfinance"),
+        )
+        for r in rows
+    ]
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            result = psycopg2.extras.execute_values(
+                cur,
+                """
+                INSERT INTO vix_data (time, close, source)
+                VALUES %s
+                ON CONFLICT (time) DO NOTHING
+                RETURNING time
+                """,
+                data,
+                fetch=True,
+            )
+            return len(result)
+
+
+def get_vix_range(start_date, end_date) -> pd.Series:
+    """Return VIX daily close as a pd.Series indexed by UTC-midnight Timestamps.
+
+    Parameters
+    ----------
+    start_date, end_date:
+        date or datetime objects for the inclusive range.
+
+    Returns
+    -------
+    pd.Series indexed by UTC Timestamps (midnight), values = VIX close.
+    Forward-fills weekends / holidays (same pattern as fx_rates).
+    Returns empty Series if no data exists for the range.
+    """
+    engine = get_engine()
+    from datetime import timedelta as _td
+    end_exclusive = end_date + _td(days=1)
     query = text(
         """
-        SELECT DISTINCT ON (ticker) ticker, close
-        FROM price_data
-        WHERE ticker = ANY(:tickers)
-        ORDER BY ticker, time DESC
+        SELECT time, close
+        FROM vix_data
+        WHERE time >= :start_dt AND time < :end_dt
+        ORDER BY time ASC
+        """
+    )
+    df = pd.read_sql(
+        query,
+        engine,
+        params={"start_dt": start_date, "end_dt": end_exclusive},
+        parse_dates=["time"],
+    )
+    if df.empty:
+        return pd.Series(dtype=float)
+
+    df["time"] = pd.to_datetime(df["time"], utc=True).dt.normalize()
+    df = df.set_index("time")["close"]
+    df = df.groupby(df.index).last()  # keep last per day
+
+    # Reindex over full calendar range and forward-fill weekends/holidays
+    full_range = pd.date_range(
+        start=pd.Timestamp(start_date, tz="UTC"),
+        end=pd.Timestamp(end_date, tz="UTC"),
+        freq="D",
+    )
+    df = df.reindex(full_range).ffill().bfill()
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: backtest results
+# ---------------------------------------------------------------------------
+
+def insert_backtest_result(result: dict) -> int:
+    """Insert one row into backtest_results. Returns the new row id.
+
+    result must contain all required columns. config is serialised as JSONB.
+    Supports optional Phase 4.5 keys: use_vol_filter, avg_vix, pct_days_elevated.
+    Supports optional Phase 4.6 keys: vroc_window, vroc_threshold, pct_days_spike.
+    Supports optional Phase 4.7 keys: use_circuit_breaker, dd_trigger, dd_reset, pct_days_breaker_active.
+    Supports optional Phase 4.8 keys: use_soft_cb, cb_soft_start, cb_hard_stop, cb_min_mult,
+        avg_cb_mult, pct_days_chatter_held, use_crisis_pos_limits, crisis_max_positions,
+        min_dollar_risk, pct_signals_below_floor.
+    Supports optional category key: 'roos'.
+    Supports optional capital_mode key: 'capital_refresh' or 'capital_compounded'.
+    Supports optional config_origin key: 'manual' or 'predicted'.
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO backtest_results (
+                    run_id, config_name, config, window_start, window_end, window_index,
+                    total_trades, win_rate, avg_win_pct, avg_loss_pct,
+                    profit_factor, cagr, sharpe_ratio, calmar_ratio,
+                    max_drawdown, final_value_usd, total_pnl_usd,
+                    annualized_vol, currency, notes,
+                    use_vol_filter, avg_vix, pct_days_elevated,
+                    vroc_window, vroc_threshold, pct_days_spike,
+                    use_circuit_breaker, dd_trigger, dd_reset, pct_days_breaker_active,
+                    use_soft_cb, cb_soft_start, cb_hard_stop, cb_min_mult,
+                    avg_cb_mult, pct_days_chatter_held,
+                    use_crisis_pos_limits, crisis_max_positions,
+                    min_dollar_risk, pct_signals_below_floor,
+                    category, config_origin, capital_mode
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s,
+                    %s, %s, %s, %s,
+                    %s, %s, %s,
+                    %s, %s, %s,
+                    %s, %s, %s,
+                    %s, %s, %s,
+                    %s, %s, %s, %s,
+                    %s, %s, %s, %s,
+                    %s, %s,
+                    %s, %s,
+                    %s, %s,
+                    %s, %s, %s
+                ) RETURNING id
+                """,
+                (
+                    result.get("run_id"),
+                    result["config_name"],
+                    json.dumps(result["config"]),
+                    result["window_start"],
+                    result["window_end"],
+                    result["window_index"],
+                    result["total_trades"],
+                    result.get("win_rate"),
+                    result.get("avg_win_pct"),
+                    result.get("avg_loss_pct"),
+                    result.get("profit_factor"),
+                    result.get("cagr"),
+                    result.get("sharpe_ratio"),
+                    result.get("calmar_ratio"),
+                    result.get("max_drawdown"),
+                    result.get("final_value_usd"),
+                    result.get("total_pnl_usd"),
+                    result.get("annualized_vol"),
+                    result.get("currency", "USD"),
+                    result.get("notes"),
+                    bool(result.get("use_vol_filter", False)),
+                    result.get("avg_vix"),
+                    result.get("pct_days_elevated"),
+                    result.get("vroc_window"),
+                    result.get("vroc_threshold"),
+                    result.get("pct_days_spike"),
+                    bool(result.get("use_circuit_breaker", False)),
+                    result.get("dd_trigger"),
+                    result.get("dd_reset"),
+                    result.get("pct_days_breaker_active"),
+                    bool(result.get("use_soft_cb", False)),
+                    result.get("cb_soft_start"),
+                    result.get("cb_hard_stop"),
+                    result.get("cb_min_mult"),
+                    result.get("avg_cb_mult"),
+                    result.get("pct_days_chatter_held"),
+                    bool(result.get("use_crisis_pos_limits", False)),
+                    result.get("crisis_max_positions"),
+                    result.get("min_dollar_risk"),
+                    result.get("pct_signals_below_floor"),
+                    result.get("category", "roos"),
+                    result.get("config_origin", "manual"),
+                    result.get("capital_mode", "capital_refresh"),
+                ),
+            )
+            row = cur.fetchone()
+            return row[0]
+
+
+def get_backtest_summary(run_id: Optional[str] = None) -> pd.DataFrame:
+    """Return aggregate ROOS metrics grouped by config_name, ordered by avg Sharpe DESC.
+
+    If run_id is provided, only rows from that execution batch are included.
+    """
+    engine = get_engine()
+    _select = """
+        SELECT
+            config_name,
+            AVG(sharpe_ratio)    AS avg_sharpe,
+            AVG(calmar_ratio)    AS avg_calmar,
+            AVG(cagr)            AS avg_cagr,
+            AVG(max_drawdown)    AS avg_max_dd,
+            AVG(win_rate)        AS avg_win_rate,
+            COUNT(*)             AS windows_tested,
+            SUM(total_pnl_usd)   AS total_pnl,
+            AVG(
+                total_pnl_usd / NULLIF(final_value_usd - total_pnl_usd, 0)
+            )                    AS avg_pnl_pct
+        FROM backtest_results
+    """
+    if run_id:
+        query = text(_select + " WHERE run_id = :rid GROUP BY config_name ORDER BY avg_sharpe DESC NULLS LAST")
+        return pd.read_sql(query, engine, params={"rid": run_id})
+    query = text(_select + " GROUP BY config_name ORDER BY avg_sharpe DESC NULLS LAST")
+    return pd.read_sql(query, engine)
+
+
+def get_backtest_results(
+    config_name: Optional[str] = None,
+    run_id: Optional[str] = None,
+) -> pd.DataFrame:
+    """Return rows from backtest_results, optionally filtered by config_name and/or run_id."""
+    engine = get_engine()
+    conditions: list[str] = []
+    params: dict = {}
+    if config_name:
+        conditions.append("config_name = :cn")
+        params["cn"] = config_name
+    if run_id:
+        conditions.append("run_id = :rid")
+        params["rid"] = run_id
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    return pd.read_sql(
+        text(f"SELECT * FROM backtest_results {where} ORDER BY config_name, window_index ASC"),
+        engine,
+        params=params or None,
+    )
+
+
+def get_backtest_run_list() -> pd.DataFrame:
+    """Return one row per distinct run_id with aggregated metrics, ordered most-recent first."""
+    engine = get_engine()
+    return pd.read_sql(
+        text(
+            """
+            SELECT
+                run_id::text                                              AS run_id,
+                MIN(run_at)                                               AS run_at,
+                array_agg(DISTINCT config_name ORDER BY config_name)      AS configs,
+                COUNT(*)::int                                             AS total_windows,
+                SUM(total_trades)::int                                    AS total_trades,
+                AVG(sharpe_ratio)                                         AS avg_sharpe,
+                AVG(cagr)                                                 AS avg_cagr,
+                AVG(max_drawdown)                                         AS avg_max_dd,
+                AVG(win_rate)                                             AS avg_win_rate,
+                SUM(total_pnl_usd)                                        AS total_pnl_usd,
+                SUM(total_pnl_usd)
+                    / NULLIF(SUM(final_value_usd - total_pnl_usd), 0)    AS total_return_pct,
+                AVG(
+                    total_pnl_usd / NULLIF(final_value_usd - total_pnl_usd, 0)
+                )                                                         AS avg_pnl_pct,
+                MIN(currency)                                             AS currency,
+                BOOL_OR(COALESCE(use_vol_filter,        false))           AS any_vol_filter,
+                BOOL_OR(COALESCE(use_circuit_breaker,   false))           AS any_circuit_breaker,
+                BOOL_OR(COALESCE(use_soft_cb,           false))           AS any_soft_cb,
+                BOOL_OR(COALESCE(use_crisis_pos_limits, false))           AS any_crisis_pos_limits,
+                MIN(COALESCE(category, 'roos'))       AS category,
+                MIN(COALESCE(config_origin, 'manual'))                    AS config_origin,
+                MIN(COALESCE(capital_mode, 'capital_refresh'))            AS capital_mode
+            FROM backtest_results
+            WHERE run_id IS NOT NULL
+            GROUP BY run_id
+            ORDER BY run_at DESC
+            """
+        ),
+        engine,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Backtest analytics (Phase 4.9)
+# ---------------------------------------------------------------------------
+
+def insert_backtest_analytics(backtest_id: int, analytics: dict) -> int:
+    """Insert pre-computed chart data for a backtest window. Returns the new row id.
+
+    analytics dict keys: equity_curve, drawdown_curve, monthly_returns,
+    regime_stats, timestamps, daily_snapshots.
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO backtest_analytics
+                    (backtest_id, equity_curve, drawdown_curve, monthly_returns, regime_stats, timestamps, daily_snapshots)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (backtest_id) DO UPDATE SET
+                    equity_curve    = EXCLUDED.equity_curve,
+                    drawdown_curve  = EXCLUDED.drawdown_curve,
+                    monthly_returns = EXCLUDED.monthly_returns,
+                    regime_stats    = EXCLUDED.regime_stats,
+                    timestamps      = EXCLUDED.timestamps,
+                    daily_snapshots = EXCLUDED.daily_snapshots
+                RETURNING id
+                """,
+                (
+                    backtest_id,
+                    json.dumps(analytics.get("equity_curve")),
+                    json.dumps(analytics.get("drawdown_curve")),
+                    json.dumps(analytics.get("monthly_returns")),
+                    json.dumps(analytics.get("regime_stats")),
+                    json.dumps(analytics.get("timestamps")),
+                    json.dumps(analytics.get("daily_snapshots")),
+                ),
+            )
+            return cur.fetchone()[0]
+
+
+def get_backtest_analytics(backtest_ids: list[int]) -> list[dict]:
+    """Return analytics rows for a list of backtest_result ids."""
+    if not backtest_ids:
+        return []
+    engine = get_engine()
+    query = text(
+        """
+        SELECT backtest_id, equity_curve, drawdown_curve, monthly_returns,
+               regime_stats, timestamps, daily_snapshots
+        FROM backtest_analytics
+        WHERE backtest_id = ANY(:ids)
+        ORDER BY backtest_id ASC
         """
     )
     with engine.connect() as conn:
-        rows = conn.execute(query, {"tickers": tickers}).fetchall()
-    return {row[0]: float(row[1]) for row in rows}
+        rows = conn.execute(query, {"ids": backtest_ids}).mappings().all()
+    return [dict(r) for r in rows]

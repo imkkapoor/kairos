@@ -9,10 +9,12 @@ import copy
 import json
 import math
 import os
+import re
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import time
 
+import pandas as pd
 import yfinance as yf
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
@@ -22,6 +24,12 @@ from db.connection import (
     get_latest_snapshot,
     get_portfolio_history,
     get_trade_history,
+    get_backtest_results,
+    get_backtest_summary,
+    get_backtest_run_list,
+    get_price_data,
+    get_backtest_analytics,
+    get_vix_range,
 )
 
 # ---------------------------------------------------------------------------
@@ -210,5 +218,167 @@ def get_trades():
         for _, row in df.iterrows():
             records.append(_serialise(row.to_dict()))
         return records
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/backtest")
+def get_backtest(config: str | None = None, run_id: str | None = None):
+    """ROOS backtest results. Optional ?config=name and/or ?run_id=UUID to filter."""
+    try:
+        df = get_backtest_results(config_name=config, run_id=run_id)
+        if df.empty:
+            return {"runs": [], "summary": [], "run_list": []}
+
+        runs = [_serialise(row.to_dict()) for _, row in df.iterrows()]
+
+        summary_df = get_backtest_summary(run_id=run_id)
+        summary = [_serialise(row.to_dict()) for _, row in summary_df.iterrows()]
+
+        run_list_df = get_backtest_run_list()
+        run_list = [_serialise(row.to_dict()) for _, row in run_list_df.iterrows()]
+
+        return {"runs": runs, "summary": summary, "run_list": run_list}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/backtest/runs")
+def get_backtest_runs():
+    """List all distinct backtest executions (one row per run_id)."""
+    try:
+        df = get_backtest_run_list()
+        return {"runs": [_serialise(row.to_dict()) for _, row in df.iterrows()]}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/backtest/analytics")
+def get_analytics(run_id: str):
+    """Pre-computed chart data (equity curve, drawdown, heatmaps) for a backtest run."""
+    try:
+        df = get_backtest_results(run_id=run_id)
+        if df.empty:
+            return {"analytics": []}
+        backtest_ids = df["id"].tolist()
+        rows = get_backtest_analytics(backtest_ids)
+        return {"analytics": [_serialise(r) for r in rows]}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/backtest/vix")
+def get_backtest_vix(run_id: str):
+    """VIX daily close aligned to the backtest window — used to overlay on equity curve."""
+    try:
+        df = get_backtest_results(run_id=run_id)
+        if df.empty:
+            return {"timestamps": [], "vix": []}
+        window_start = df["window_start"].min()
+        window_end = df["window_end"].max()
+        vix = get_vix_range(window_start, window_end)
+        if vix.empty:
+            return {"timestamps": [], "vix": []}
+        timestamps = [ts.strftime("%Y-%m-%d") for ts in vix.index]
+        values = [round(float(v), 2) if not math.isnan(v) else None for v in vix.values]
+        return {"timestamps": timestamps, "vix": values}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ---------------------------------------------------------------------------
+# Ticker chart
+# ---------------------------------------------------------------------------
+
+# Allowed characters in a ticker symbol — prevents path-traversal/injection
+_TICKER_RE = re.compile(r"^[A-Z0-9.\-=^]{1,20}$")
+
+# Map range label → how to fetch data
+_RANGE_CONFIG: dict[str, dict] = {
+    "1D":  {"source": "live", "period": "1d",   "yf_interval": "1m"},
+    "1W":  {"source": "db",   "days": 7,        "interval": "1d"},
+    "1M":  {"source": "db",   "days": 30,       "interval": "1d"},
+    "3M":  {"source": "db",   "days": 90,       "interval": "1d"},
+    "6M":  {"source": "db",   "days": 180,      "interval": "1d"},
+    "YTD": {"source": "db",   "ytd": True,      "interval": "1d"},
+    "1Y":  {"source": "db",   "days": 365,      "interval": "1d"},
+    "5Y":  {"source": "db",   "days": 365 * 5,  "interval": "1d"},
+}
+
+
+@app.get("/api/ticker/{ticker}")
+def get_ticker_chart(ticker: str, range: str = "1M"):
+    """OHLCV bars + trades for a single ticker. Used by the position drawer."""
+    ticker = ticker.upper()
+    if not _TICKER_RE.match(ticker):
+        raise HTTPException(status_code=400, detail="Invalid ticker symbol")
+    if range not in _RANGE_CONFIG:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid range. Must be one of: {', '.join(_RANGE_CONFIG)}",
+        )
+
+    cfg = _RANGE_CONFIG[range]
+
+    try:
+        bars: list[dict] = []
+
+        if cfg["source"] == "live":
+            with _yf_lock:
+                raw = yf.download(
+                    ticker,
+                    period=cfg["period"],
+                    interval=cfg["yf_interval"],
+                    progress=False,
+                    auto_adjust=True,
+                )
+            if not raw.empty:
+                if isinstance(raw.columns, pd.MultiIndex):
+                    raw.columns = raw.columns.get_level_values(0)
+                raw.columns = [str(c).lower().strip() for c in raw.columns]
+                if raw.index.tz is None:
+                    raw.index = raw.index.tz_localize("UTC")
+                else:
+                    raw.index = raw.index.tz_convert("UTC")
+                for ts, row in raw.iterrows():
+                    bars.append({
+                        "time":   ts.isoformat(),
+                        "open":   round(float(row["open"]),  4) if pd.notna(row["open"])  else None,
+                        "high":   round(float(row["high"]),  4) if pd.notna(row["high"])  else None,
+                        "low":    round(float(row["low"]),   4) if pd.notna(row["low"])   else None,
+                        "close":  round(float(row["close"]), 4) if pd.notna(row["close"]) else None,
+                        "volume": int(row["volume"])             if pd.notna(row["volume"]) else None,
+                    })
+
+        else:
+            now = datetime.now(timezone.utc)
+            if cfg.get("ytd"):
+                start = datetime(now.year, 1, 1, tzinfo=timezone.utc)
+            else:
+                start = now - timedelta(days=cfg["days"])
+
+            price_df = get_price_data(ticker, interval=cfg["interval"], start=start)
+            if not price_df.empty:
+                for ts, row in price_df.iterrows():
+                    bars.append({
+                        "time":   ts.isoformat(),
+                        "open":   round(float(row["open"]),  4) if pd.notna(row["open"])  else None,
+                        "high":   round(float(row["high"]),  4) if pd.notna(row["high"])  else None,
+                        "low":    round(float(row["low"]),   4) if pd.notna(row["low"])   else None,
+                        "close":  round(float(row["close"]), 4) if pd.notna(row["close"]) else None,
+                        "volume": int(row["volume"])             if pd.notna(row["volume"]) else None,
+                    })
+
+        trades_df = get_trade_history(ticker=ticker, limit=10_000)
+        trades = (
+            [_serialise(row.to_dict()) for _, row in trades_df.iterrows()]
+            if not trades_df.empty
+            else []
+        )
+
+        return {"ticker": ticker, "range": range, "bars": bars, "trades": trades}
+
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))

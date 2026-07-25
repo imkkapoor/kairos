@@ -19,7 +19,8 @@ Steps:
  10. Print daily summary
 """
 
-from datetime import date, timezone, datetime
+from datetime import date, timezone, datetime, timedelta
+from typing import Optional
 
 from loguru import logger
 
@@ -182,12 +183,26 @@ def _print_summary(
 # Public API
 # ---------------------------------------------------------------------------
 
-def run_daily_scan(interval: str = "1d") -> None:
-    """Run the full Kairos daily signal scan and persist results to the DB."""
-    logger.info("[scanner] Starting daily scan")
+def run_daily_scan(
+    interval: str = "1d",
+    for_date: Optional[datetime] = None,
+) -> None:
+    """Run the full Kairos daily signal scan and persist results to the DB.
+
+    Parameters
+    ----------
+    for_date:
+        When set, replay the scan for this historical date using price/indicator
+        data already stored in the DB. Useful for catching up after missed days.
+        Defaults to the most recent trading day (live mode).
+    """
+    if for_date is not None:
+        logger.info(f"[scanner] Starting historical scan for {for_date.date()}")
+    else:
+        logger.info("[scanner] Starting daily scan")
 
     # 1. Compute (or retrieve from DB) all indicator rows
-    today_indicators = compute_all(interval=interval)
+    today_indicators = compute_all(interval=interval, for_date=for_date)
     total_tickers    = len(today_indicators) if today_indicators else 0
     computed         = total_tickers
     logger.info(f"[scanner] Indicators ready for {computed} tickers")
@@ -209,7 +224,8 @@ def run_daily_scan(interval: str = "1d") -> None:
 
     # 2. SPY price data for crisis detection
     try:
-        spy_df = get_price_data("SPY", interval=interval, limit=10)
+        spy_end = (for_date + timedelta(days=1)) if for_date is not None else None
+        spy_df = get_price_data("SPY", interval=interval, limit=10, end=spy_end)
     except Exception as exc:
         logger.warning(f"[scanner] Could not fetch SPY data: {exc} — defaulting to non-crisis")
         spy_df = None
@@ -236,7 +252,7 @@ def run_daily_scan(interval: str = "1d") -> None:
 
     # 6. Previous indicator rows (for crossover detection)
     try:
-        prev_indicators = get_prev_indicators(tickers, interval=interval)
+        prev_indicators = get_prev_indicators(tickers, interval=interval, for_date=for_date)
     except Exception as exc:
         logger.warning(f"[scanner] Could not fetch prev indicators: {exc} — crossovers disabled")
         prev_indicators = {}
@@ -355,3 +371,31 @@ def run_daily_scan(interval: str = "1d") -> None:
     )
 
     logger.info("[scanner] Daily scan complete")
+
+
+if __name__ == "__main__":
+    """CLI: python -m strategies.scanner [--date YYYY-MM-DD]
+
+    Without --date: scans the most recent trading day (live mode).
+    With --date:    replays the scan for that historical date.
+    """
+    import sys
+
+    _for_date = None
+    _args = sys.argv[1:]
+    _i = 0
+    while _i < len(_args):
+        if _args[_i] == "--date" and _i + 1 < len(_args):
+            _for_date = datetime.strptime(_args[_i + 1], "%Y-%m-%d").replace(
+                tzinfo=timezone.utc
+            )
+            _i += 2
+        elif _args[_i].startswith("--date="):
+            _for_date = datetime.strptime(
+                _args[_i].split("=", 1)[1], "%Y-%m-%d"
+            ).replace(tzinfo=timezone.utc)
+            _i += 1
+        else:
+            _i += 1
+
+    run_daily_scan(for_date=_for_date)

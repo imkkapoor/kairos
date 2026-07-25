@@ -87,9 +87,6 @@ CREATE TABLE IF NOT EXISTS trades (
     fill_type       TEXT             -- 'Normal Fill' | 'Capped to Max Size' | 'Partial Fill' | 'Capped & Partial'
 );
 
--- Idempotent migration: add fill_type to pre-existing tables.
-ALTER TABLE trades ADD COLUMN IF NOT EXISTS fill_type TEXT;
-
 -- ---------------------------------------------------------------------------
 -- portfolio_snapshots: point-in-time portfolio state (hypertable)
 -- ---------------------------------------------------------------------------
@@ -147,3 +144,88 @@ CREATE TABLE IF NOT EXISTS fetch_log (
     notes           TEXT,
     fetch_time      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- ---------------------------------------------------------------------------
+-- backtest_results: rolling out-of-sample (ROOS) window results (Phase 4)
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS backtest_results (
+    id              SERIAL PRIMARY KEY,
+    run_at          TIMESTAMPTZ      NOT NULL DEFAULT NOW(),
+    run_id          UUID,                         -- groups all windows from one make-backtest execution
+    config_name     TEXT             NOT NULL,
+    config          JSONB,
+    window_start    DATE             NOT NULL,
+    window_end      DATE             NOT NULL,
+    window_index    INTEGER          NOT NULL,
+    total_trades    INTEGER,
+    win_rate        DOUBLE PRECISION,
+    avg_win_pct     DOUBLE PRECISION,
+    avg_loss_pct    DOUBLE PRECISION,
+    profit_factor   DOUBLE PRECISION,
+    cagr            DOUBLE PRECISION,
+    sharpe_ratio    DOUBLE PRECISION,
+    calmar_ratio    DOUBLE PRECISION,
+    max_drawdown    DOUBLE PRECISION,
+    final_value_usd DOUBLE PRECISION,
+    total_pnl_usd   DOUBLE PRECISION,
+    annualized_vol  DOUBLE PRECISION,
+    currency        TEXT             NOT NULL DEFAULT 'USD',
+    notes           TEXT,
+    -- Vol filter (Phase 4.5)
+    use_vol_filter      BOOLEAN          DEFAULT FALSE,
+    avg_vix             DOUBLE PRECISION,
+    pct_days_elevated   DOUBLE PRECISION,
+    -- VROC spike (Phase 4.6)
+    vroc_window         INTEGER          DEFAULT 10,
+    vroc_threshold      DOUBLE PRECISION DEFAULT 0.20,
+    pct_days_spike      DOUBLE PRECISION,
+    -- Circuit breaker (Phase 4.7)
+    use_circuit_breaker     BOOLEAN          DEFAULT FALSE,
+    dd_trigger              DOUBLE PRECISION DEFAULT 0.15,
+    dd_reset                DOUBLE PRECISION DEFAULT 0.10,
+    pct_days_breaker_active DOUBLE PRECISION,
+    -- Soft circuit breaker (Phase 4.8)
+    use_soft_cb             BOOLEAN          DEFAULT FALSE,
+    cb_soft_start           DOUBLE PRECISION,
+    cb_hard_stop            DOUBLE PRECISION,
+    cb_min_mult             DOUBLE PRECISION,
+    avg_cb_mult             DOUBLE PRECISION,
+    pct_days_chatter_held   DOUBLE PRECISION,
+    use_crisis_pos_limits   BOOLEAN          DEFAULT FALSE,
+    crisis_max_positions    INTEGER,
+    min_dollar_risk         DOUBLE PRECISION,
+    pct_signals_below_floor DOUBLE PRECISION,
+    -- ROOS metadata
+    category        TEXT             DEFAULT 'roos',          -- always 'roos' (Rolling Out-of-Sample)
+    capital_mode    TEXT             DEFAULT 'capital_refresh', -- capital_refresh | capital_compounded
+    config_origin   TEXT             DEFAULT 'manual'          -- manual (hand-crafted) | predicted (ML-optimised)
+);
+
+-- ---------------------------------------------------------------------------
+-- backtest_analytics: pre-computed chart data for backtest visualisation (Phase 4.9)
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS backtest_analytics (
+    id              SERIAL PRIMARY KEY,
+    backtest_id     INTEGER          NOT NULL REFERENCES backtest_results(id) ON DELETE CASCADE,
+    equity_curve    JSONB,           -- Array of daily portfolio values
+    drawdown_curve  JSONB,           -- Array of daily drawdown percentages
+    monthly_returns JSONB,           -- Nested: Year -> Month -> return value
+    regime_stats    JSONB,           -- Nested: Strategy -> Regime -> net PnL
+    timestamps      JSONB,           -- Array of ISO date strings (aligns with curves)
+    daily_snapshots JSONB,           -- Array of {date, positions, cash, total_value, total_pnl}
+    UNIQUE(backtest_id)
+);
+
+-- ---------------------------------------------------------------------------
+-- vix_data: daily VIX close prices for volatility regime filtering (Phase 4.5)
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS vix_data (
+    time   TIMESTAMPTZ      NOT NULL,
+    close  DOUBLE PRECISION NOT NULL,
+    source TEXT             NOT NULL DEFAULT 'yfinance',
+    CONSTRAINT vix_data_unique UNIQUE (time)
+);
+
+SELECT create_hypertable('vix_data', 'time', if_not_exists => TRUE);
+
+CREATE INDEX IF NOT EXISTS idx_vix_data_time ON vix_data (time DESC);
