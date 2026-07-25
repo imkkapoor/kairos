@@ -1005,13 +1005,19 @@ def close_trade(ticker: str, exit_price: float, exit_reason: str, trade_time: Op
 
     Actions (atomic):
       1. Find the most recent open buy trade for *ticker* (status='filled', side='buy').
-      2. Insert a sell trade row with the same quantity, strategy, currency and fx_rate.
+      2. Insert a sell trade row with the same quantity and strategy.
       3. Mark the original buy trade status='closed'.
+
+    Note: the trades table has no currency/fx_rate columns — per-trade FX is not
+    persisted here. Currency-aware realised P&L (base currency) is computed by
+    simulator.Portfolio.close_position and captured in portfolio_snapshots.
 
     Returns
     -------
     float
-        Realised P&L = (exit_price - original_fill_price) * quantity.
+        Informational realised P&L in the fill-price currency
+        = (exit_price - original_fill_price) * quantity. This is NOT currency-
+        converted; callers that need base-currency P&L use Portfolio.close_position.
         Returns 0.0 if no open buy trade is found.
     """
     now = trade_time if trade_time is not None else datetime.now(timezone.utc)

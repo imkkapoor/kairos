@@ -30,10 +30,13 @@ Opens at **http://localhost:3000**. Requires the FastAPI backend (`make api`) an
 All data comes from the FastAPI server at `http://localhost:8000`.
 
 ```
-GET /api/portfolio/summary        Portfolio value + positions
-GET /api/trades                   Trade history (paginated)
-GET /api/backtest/runs            All backtest run summaries
-GET /api/backtest/runs/{run_id}   Single run detail with equity curves
+GET /api/dashboard                     Portfolio snapshot + live market metrics (^GSPC, CL=F, CAD=X, ^VIX)
+GET /api/trades                        Trade history (up to 10k, newest first)
+GET /api/backtest?config=&run_id=      ROOS results { runs, summary, run_list }
+GET /api/backtest/runs                 One row per run_id
+GET /api/backtest/analytics?run_id=    Pre-computed chart payloads (equity/drawdown/heatmap)
+GET /api/backtest/vix?run_id=          VIX series aligned to a backtest window
+GET /api/ticker/{ticker}?range=        OHLCV bars + per-ticker trade overlay
 ```
 
 See `backend/api/api.py` for full route definitions.

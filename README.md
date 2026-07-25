@@ -11,9 +11,9 @@ See [ALLOCATION.md](ALLOCATION.md) for the full breakdown of signal strength, z-
 | Layer      | Technology                                            |
 |------------|-------------------------------------------------------|
 | Data store | TimescaleDB (PostgreSQL 16 + time-series ext.)        |
-| Backend    | Python 3.13+, pandas, pandas-ta, yfinance, matplotlib |
+| Backend    | Python 3.13+, pandas, pandas-ta, yfinance, numpy      |
 | Scheduler  | `schedule` + `zoneinfo` (ET-aware)                   |
-| Dashboard  | Next.js 15 (Phase 6)                                  |
+| Dashboard  | Next.js 15 (Phase 7)                                  |
 | Container  | Docker Compose (DB only — Python runs locally)        |
 
 ---
@@ -35,11 +35,13 @@ make run                # start the weekday scheduler
 
 Kairos follows a **scan → execute → manage** cycle, with CAD as the base portfolio currency.
 
-**Evening:** `update_all()` pulls closing OHLCV → `run_daily_scan()` computes indicators, runs all 5 strategies, and persists signals with strength + z-scores.
+**Evening (17:00 / 17:15 ET):** `update_all()` pulls closing OHLCV → `run_daily_scan()` computes indicators, runs all 5 strategies, and persists signals with strength + z-scores.
 
-**Morning (9:31 AM ET):** `run_morning()` loads last night's signals, fetches the 9:31 AM opening bar for prices and USDCAD FX rate in one batch yfinance call, sizes positions via ATR-based risk, and opens paper trades. Fill prices and FX rates are pinned to the same 9:31 AM bar.
+**Morning (9:31 AM ET):** `run_morning()` loads last night's signals, fetches the 9:31 AM opening bar for prices and USDCAD FX rate in one batch yfinance call. It first runs position management (stop-losses, take-profits, trailing stops, signal reversals, time exits) on any open positions, then sizes new positions via ATR-based risk and opens paper trades. Fill prices, FX rates, and trade timestamps are all pinned to the same 9:31 AM bar.
 
-**Evening (5:25 PM ET):** `run_evening()` reads closing prices from the DB (no yfinance call) and checks stop-losses, take-profits, trailing stops, signal reversals, and time-based exits.
+**Intraday (hourly, 10:00–15:58 ET):** `run_intraday()` fetches live 1-minute prices for open positions and re-runs the same position-management checks, persisting any exits / trailing-stop updates and taking a portfolio snapshot each hour.
+
+**Evening management (17:25 ET):** `run_evening()` reads closing prices from the DB (no yfinance call) and re-runs the position-management checks on official closes. It can also be run manually with `make simulate-evening` (e.g. for historical replay with `DATE=`).
 
 ### Multi-Currency
 
@@ -48,20 +50,23 @@ Kairos follows a **scan → execute → manage** cycle, with CAD as the base por
 | US     | USD      | USDCAD=X (yfinance, 9:31 AM bar) |
 | CA     | CAD      | 1.0 (base) |
 
-FX rates are stored in the `fx_rates` table after the morning fetch; `run_evening()` reuses the same rate rather than re-fetching.
+FX rates are stored in the `fx_rates` table after the morning fetch; later runs (`run_intraday()`, and a manual `run_evening()`) reuse the same day's stored rate rather than re-fetching.
 
 ---
 
 ## Scheduler (weekdays only, ET)
 
-| Time      | Job                | What it does                              |
-|-----------|--------------------|-------------------------------------------|
-| 07:00     | Morning digest     | Phase 6 placeholder                       |
-| 09:31     | `run_morning()`    | Batch price + FX fetch → execute signals  |
-| 17:00     | `update_all()`     | Incremental OHLCV for all tickers         |
-| 17:15     | `run_daily_scan()` | Compute indicators → generate signals     |
-| 17:25     | `run_evening()`    | DB close prices → stop/TP/exit checks     |
-| Every hr  | DB health check    | Runs on weekends too                      |
+| Time              | Job                    | What it does                                        |
+|-------------------|------------------------|-----------------------------------------------------|
+| 07:00             | Morning digest         | Phase 6 placeholder                                 |
+| 09:31             | `run_morning()`        | Pre-open management + batch price/FX fetch → execute signals |
+| 10:00–15:58 (hourly) | `run_intraday()`    | Live-price position management (stop/TP/trailing)   |
+| 17:00             | `update_all()`         | Incremental OHLCV for all tickers                   |
+| 17:15             | `run_daily_scan()`     | Compute indicators → generate signals               |
+| 17:25             | `run_evening()`        | DB close prices → stop/TP/exit checks               |
+| Every hr          | DB health check        | Runs on weekends too                                |
+
+Weekday ET jobs are gated on the NYSE trading calendar; intraday management runs whenever NYSE **or** TSX is open. `run_evening()` is also available manually via `make simulate-evening`.
 
 ---
 
@@ -105,7 +110,7 @@ flowchart TD
     A["make backtest"] --> B["Pre-flight checks\n(ping DB, verify data counts)"]
     B --> C["generate_roos_windows()\n14 windows × 6-month steps\n2019-01 → 2026-01"]
     C --> D["get_watchlist() → ~600 tickers\nget_sector_map()"]
-    D --> E{"For each of\n17 allocation configs"}
+    D --> E{"For each of\n16 allocation configs"}
 
     E --> F["load_ohlcv() + load_indicators()\n+ load_fx_rates()\nFull range loaded ONCE"]
 
@@ -144,25 +149,26 @@ flowchart TD
 
 ### Allocation Configs
 
+The source of truth is `backtesting/config.CONFIGS` (16 configs). Current set:
+
 | Config | Strategy bias | Min strength | Max positions | Phase |
 |---|---|---|---|---|
-| `equal_weight` | All strategies 1.0 | 0.10 | 20 | 4 |
-| `momentum_heavy` | Momentum 1.5×, RSI 0.5× | 0.10 | 20 | 4 |
-| `regime_adaptive` | Per-regime overrides | 0.10 | 20 | 4 |
+| `live_default` | All strategies 1.0 (mirrors live env-var settings) | 0.10 | 20 | 4 |
+| `momentum_heavy` | Momentum 1.5×, MACD 1.2×, RSI 0.5× | 0.10 | 20 | 4 |
+| `regime_adaptive` | Per-regime strategy overrides | 0.10 | 20 | 4 |
 | `conservative` | Tighter filters, fewer positions | 0.15 | 15 | 4 |
 | `aggressive` | Lower bar, more positions | 0.05 | 25 | 4 |
-| `live_default` | Mirrors live env-var settings | 0.10 | 20 | 4 |
-| `vol_filtered_default` | All 1.0 + VIX filter | 0.10 | 20 | 4.5 |
-| `vol_filtered_conservative` | Conservative + VIX filter | 0.15 | 15 | 4.5 |
-| `vol_filtered_regime_adaptive` | Regime adaptive + VIX filter | 0.10 | 20 | 4.5 |
-| `vol_adaptive_vroc` | Regime adaptive + VIX + VROC spike | 0.10 | 20 | 4.6 |
-| `vol_adaptive_full` | VROC + binary circuit breaker (15%) | 0.10 | 20 | 4.7 |
-| `vol_adaptive_tight_cb` | VROC + tighter circuit breaker (10%) | 0.10 | 20 | 4.7 |
-| `vol_adaptive_soft_cb` | Soft CB (linear de-lever), no crisis limits | 0.10 | 20 | 4.8 |
-| `vol_adaptive_full_v2` | Soft CB + crisis pos limits + dollar floor | 0.10 | 20 | 4.8 |
-| `vol_adaptive_conservative_v2` | Conservative + full risk stack | 0.15 | 12 | 4.8 |
-| `adaptive_shield_v1` | Streamlined soft CB + regime adaptive | 0.10 | 20 | Latest |
+| `vol_baseline` | Equal-weight + VIX filter | 0.10 | 20 | 4.5 |
+| `vol_conservative` | Conservative + VIX filter | 0.15 | 15 | 4.5 |
+| `vol_regime_adaptive` | Regime adaptive + VIX filter | 0.10 | 20 | 4.5 |
+| `vol_vroc_adaptive` | Regime adaptive + VIX + VROC spike | 0.10 | 20 | 4.6 |
+| `vol_hard_cb` | VROC + binary circuit breaker (15%) | 0.10 | 20 | 4.7 |
+| `vol_hard_cb_tight` | VROC + tighter circuit breaker (10%) | 0.10 | 20 | 4.7 |
+| `vol_soft_cb` | Soft CB (linear de-lever), no crisis limits | 0.10 | 20 | 4.8 |
+| `vol_soft_cb_full` | Soft CB + crisis pos limits + dollar floor | 0.10 | 20 | 4.8 |
+| `vol_conservative_full` | Conservative + full risk stack | 0.15 | 12 | 4.8 |
 | `vol_recovery_v1` | Soft CB + multi-trigger recovery + dynamic floor | 0.10 | 20 | 4.10 |
+| `chatgpt_adaptive_recovery` | Tuned weights + full risk stack + fast recovery | 0.12 | 16 | 4.10 |
 
 Results in `backtest_results` table. Query with `make shell-db`:
 ```sql
@@ -195,7 +201,7 @@ FROM backtest_results GROUP BY config_name ORDER BY avg_sharpe DESC;
 | `hydrate-indicators`  | Backfill full historical indicators for all tickers (for backtesting)|
 | `hydrate-fx`          | Backfill USDCAD FX rates from 2017                                  |
 | `fetch-vix`           | One-time VIX history backfill from 2017-01-02 (run before backtest) |
-| `backtest`            | ROOS backtest across all 17 allocation configs (~14 windows each)    |
+| `backtest`            | ROOS backtest across all 16 allocation configs × both capital modes  |
 | `backtest-config`     | ROOS backtest for one config — `CONFIG=regime_adaptive`              |
 | `shell-db`            | Open `psql` session                                                 |
 | `reset-db`            | **DESTRUCTIVE** — wipe all data and recreate the database           |
@@ -231,7 +237,7 @@ kairos/
 │   │   ├── portfolio.py            ← in-memory portfolio with risk limits
 │   │   └── position_manager.py     ← stop/TP/trailing stop checker
 │   ├── backtesting/
-│   │   ├── config.py               ← ROOS params + 17 allocation configs
+│   │   ├── config.py               ← ROOS params + 16 allocation configs
 │   │   ├── data_loader.py          ← DB data loading + ROOS window generation
 │   │   ├── portfolio_runner.py     ← day-by-day simulation engine
 │   │   └── run_backtest.py         ← CLI entry point (make backtest)
@@ -258,13 +264,14 @@ Or: `make shell-db`
 | `price_data`          | hypertable | OHLCV bars (daily + intraday)                      |
 | `indicators`          | hypertable | Computed technical indicators per ticker/day       |
 | `signals`             | regular    | Strategy signals with strength + z_score           |
-| `trades`              | regular    | Paper trades with fill price, SL, TP, FX rate      |
+| `trades`              | regular    | Paper trades — fill price, SL, TP, strategy, `fill_type`, status |
 | `portfolio_snapshots` | hypertable | Point-in-time portfolio state (CAD)                |
 | `watchlist`           | regular    | Universe of tracked tickers                        |
 | `fx_rates`            | hypertable | Daily USDCAD rates                                 |
 | `vix_data`            | hypertable | Daily VIX close prices from 2017 (Phase 4.5)       |
 | `fetch_log`           | regular    | Audit log for every yfinance fetch                 |
 | `backtest_results`    | regular    | ROOS results — one row per config per window        |
+| `backtest_analytics`  | regular    | Pre-computed chart payloads per backtest row        |
 
 **Indicators computed:** `rsi_14`, `ma_50`, `ma_200`, `ema_20`, `bb_upper/mid/lower`, `atr_14`, `adx_14`, `volume_sma`, `macd_line`, `macd_signal`, `macd_hist`, `roc_20`
 

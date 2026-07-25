@@ -192,7 +192,7 @@ def run_morning(for_date: Optional[datetime] = None) -> None:
     pre_open_trailing_updates: list[dict] = []
     if portfolio.positions:
         close_actions, trailing_stop_updates = position_manager.check_positions(
-            portfolio, current_prices, today_indicators, todays_signals
+            portfolio, current_prices, today_indicators, todays_signals, as_of=now
         )
         for action in close_actions:
             pos_ccy = portfolio.positions.get(action["ticker"], {}).get("currency", "USD")
@@ -416,7 +416,7 @@ def run_evening(for_date: Optional[datetime] = None) -> None:
     # 4. Position management: close exits + trailing stop updates
     # ------------------------------------------------------------------
     close_actions, trailing_stop_updates = position_manager.check_positions(
-        portfolio, closing_prices, today_indicators, todays_signals
+        portfolio, closing_prices, today_indicators, todays_signals, as_of=now
     )
 
     summary_closed: list[dict] = []
@@ -557,7 +557,7 @@ def run_intraday() -> None:
     # 5. Check positions for exits / trailing stop updates
     # ------------------------------------------------------------------
     close_actions, trailing_stop_updates = position_manager.check_positions(
-        portfolio, current_prices, today_indicators, todays_signals
+        portfolio, current_prices, today_indicators, todays_signals, as_of=now
     )
 
     summary_closed: list[dict] = []

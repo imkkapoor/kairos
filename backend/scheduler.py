@@ -5,6 +5,7 @@ Jobs (all times Eastern Time, DST-aware via zoneinfo):
   07:00 ET weekdays  — Morning digest placeholder (Phase 6)
   17:00 ET weekdays  — Incremental OHLCV update via update_all()
   17:15 ET weekdays  — Strategy scan: compute indicators + generate signals
+  17:25 ET weekdays  — Evening management: stop/TP/exit checks on DB close prices
   09:31 ET weekdays  — Morning execution: live batch price fetch + execute signals
   Hourly (10:00–15:58 ET weekdays) — Intraday management: live price check,
                                       stop/TP/trailing-stop evaluation
@@ -111,6 +112,15 @@ def _job_intraday_management() -> None:
     run_intraday()
 
 
+def _job_evening_management() -> None:
+    """17:25 ET weekdays — position management on today's DB close prices."""
+    if not _is_trading_day():
+        logger.info("Scheduler: skipping evening management — not a NYSE trading day")
+        return
+    from simulator.simulator import run_evening
+    run_evening()
+
+
 def _job_morning_digest() -> None:
     """07:00 ET weekdays — morning digest (Phase 6)."""
     logger.info("Morning digest — Phase 6")
@@ -141,6 +151,7 @@ _ET_JOBS = [
     (15, 58, True,  _job_intraday_management),
     (17, 0,  True,  _job_update_all),
     (17, 15, True,  _job_strategy_scan),
+    (17, 25, True,  _job_evening_management),
 ]
 
 
@@ -194,7 +205,7 @@ def main() -> None:
         "Scheduler running. "
         "ET jobs: 07:00 digest (P6), 09:31 morning execution, "
         "10:00-15:58 intraday management (hourly), "
-        "17:00 fetch, 17:15 scan. "
+        "17:00 fetch, 17:15 scan, 17:25 evening management. "
         "Hourly health check active. "
         "Press Ctrl+C to stop."
     )
