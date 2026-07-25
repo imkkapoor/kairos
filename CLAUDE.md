@@ -20,7 +20,7 @@ The day-to-day flow:
 1. **17:00 ET** — fetch closing OHLCV for the whole watchlist (`update_all()` in `data/fetcher.py`).
 2. **17:15 ET** — compute indicators, run 5 strategies, persist signals with strength + cross-universe z-scores (`strategies/scanner.py`).
 3. **09:31 ET next day** — fetch the 9:31 opening bar in one yfinance batch call, fetch USDCAD FX, execute last night's signals (size positions via ATR), open paper trades (`simulator/simulator.py: run_morning`).
-4. **10:00–15:58 ET hourly** — intraday position management on live prices: stop-loss, take-profit, trailing stops (`run_intraday`).
+4. **10:00–15:58 ET every 15 min** — intraday position management on live prices: stop-loss, take-profit, trailing stops (`run_intraday`).
 5. **17:25 ET** — evening position management from DB close prices (`run_evening`).
 
 CAD is the **portfolio base currency** by default (`PORTFOLIO_CURRENCY=CAD` in `.env`). US positions are converted via the 9:31 ET USDCAD rate stored in `fx_rates`.
@@ -296,7 +296,7 @@ Reads close prices **from `price_data` DB only — no yfinance call** (the 17:00
 
 ### 5.4 Intraday management (`run_intraday`)
 
-Hourly 10:00–15:58 ET. Fetches live 1-min bars for open positions, fills holiday gaps with `get_latest_close_prices`, runs the same position_manager, persists exits + trailing-stop updates, and *always* takes a snapshot so the equity curve has hourly resolution.
+Every 15 min 10:00–15:58 ET. Fetches live 1-min bars for open positions, fills holiday gaps with `get_latest_close_prices`, runs the same position_manager, persists exits + trailing-stop updates, and *always* takes a snapshot so the equity curve has 15-minute resolution.
 
 ### 5.5 Exit priority in `position_manager.check_positions`
 
