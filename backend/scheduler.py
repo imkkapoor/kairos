@@ -7,8 +7,8 @@ Jobs (all times Eastern Time, DST-aware via zoneinfo):
   17:15 ET weekdays  — Strategy scan: compute indicators + generate signals
   17:25 ET weekdays  — Evening management: stop/TP/exit checks on DB close prices
   09:31 ET weekdays  — Morning execution: live batch price fetch + execute signals
-  Hourly (10:00–15:58 ET weekdays) — Intraday management: live price check,
-                                      stop/TP/trailing-stop evaluation
+  Every 15 min (10:00–15:58 ET weekdays) — Intraday management: live price check,
+                                            stop/TP/trailing-stop evaluation
   Every hour (daily) — DB health check (runs weekends too)
 
 The scheduler polls every 30 seconds. ET-timed jobs use a zoneinfo-based
@@ -104,7 +104,7 @@ def _job_morning_execution() -> None:
 
 
 def _job_intraday_management() -> None:
-    """10:00–15:58 ET weekdays (hourly) — live price check + position management."""
+    """10:00–15:58 ET weekdays (every 15 min) — live price check + position management."""
     if not _is_any_market_open():
         logger.info("Scheduler: skipping intraday management — all markets closed")
         return
@@ -142,17 +142,17 @@ def _job_health_check() -> None:
 _ET_JOBS = [
     (7,  0,  True,  _job_morning_digest),
     (9,  31, True,  _job_morning_execution),
-    (10, 0,  True,  _job_intraday_management),
-    (11, 0,  True,  _job_intraday_management),
-    (12, 0,  True,  _job_intraday_management),
-    (13, 0,  True,  _job_intraday_management),
-    (14, 0,  True,  _job_intraday_management),
-    (15, 0,  True,  _job_intraday_management),
-    (15, 58, True,  _job_intraday_management),
     (17, 0,  True,  _job_update_all),
     (17, 15, True,  _job_strategy_scan),
     (17, 25, True,  _job_evening_management),
 ]
+
+# Intraday position management every 15 minutes while the market is open
+# (10:00–15:45 ET), plus a final near-close check at 15:58.
+for _h in range(10, 16):
+    for _m in (0, 15, 30, 45):
+        _ET_JOBS.append((_h, _m, True, _job_intraday_management))
+_ET_JOBS.append((15, 58, True, _job_intraday_management))
 
 
 def _dispatch_et_jobs() -> None:
@@ -204,7 +204,7 @@ def main() -> None:
     logger.info(
         "Scheduler running. "
         "ET jobs: 07:00 digest (P6), 09:31 morning execution, "
-        "10:00-15:58 intraday management (hourly), "
+        "10:00-15:58 intraday management (every 15 min), "
         "17:00 fetch, 17:15 scan, 17:25 evening management. "
         "Hourly health check active. "
         "Press Ctrl+C to stop."
