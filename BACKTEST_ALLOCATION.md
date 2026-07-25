@@ -578,26 +578,25 @@ to Phase 4 baseline configs.
 | Config | Weights | `min_str` | Pos | Sec | Vol | VROC | CB | Phase |
 |--------|---------|-----------|-----|-----|-----|------|----|-------|
 | `live_default` | all 1.0 | 0.10 | 20 | 30% | – | – | – | 4 |
-| `equal_weight` | all 1.0 | 0.10 | 20 | 30% | – | – | – | 4 |
 | `momentum_heavy` | mom 1.5, macd 1.2, rsi+rev 0.5/0.4 | 0.10 | 20 | 30% | – | – | – | 4 |
 | `regime_adaptive` | all 1.0 + per-regime overrides | 0.10 | 20 | 30% | – | – | – | 4 |
 | `conservative` | rsi+mom 1.0, macd 0.8, rev 0.6, sect 0.5 | 0.15 | 15 | 25% | – | – | – | 4 |
 | `aggressive` | mom 1.2, rest 1.0/0.8 | 0.05 | 25 | 35% | – | – | – | 4 |
-| `vol_filtered_default` | all 1.0 | 0.10 | 20 | 30% | ✓ | – | – | 4.5 |
-| `vol_filtered_conservative` | rsi+mom 1.0, macd 0.8, rev 0.6, sect 0.5 | 0.15 | 15 | 25% | ✓ | – | – | 4.5 |
-| `vol_filtered_regime_adaptive` | all 1.0 + overrides | 0.10 | 20 | 30% | ✓ | – | – | 4.5 |
-| `vol_adaptive_vroc` | conservative weights + overrides | 0.10 | 20 | 30% | ✓ | ✓ | – | 4.6 |
-| `vol_adaptive_full` | conservative weights + overrides | 0.10 | 20 | 30% | ✓ | ✓ | binary | 4.7 |
-| `vol_adaptive_tight_cb` | same (tighter CB 10% trigger) | 0.10 | 20 | 30% | ✓ | ✓ | binary | 4.7 |
-| `vol_adaptive_soft_cb` | conservative weights + overrides | 0.10 | 20 | 30% | ✓ | ✓ | soft | 4.8 |
-| `vol_adaptive_full_v2` | conservative + crisis limits + floor | 0.10 | 20 | 30% | ✓ | ✓ | soft | 4.8 |
-| `vol_adaptive_conservative_v2` | conservative + full stack | 0.15 | 12 | 20% | ✓ | ✓ | soft | 4.8 |
-| `adaptive_shield_v1` | conservative weights + overrides | 0.10 | 20 | 30% | ✓ | – | soft | Latest |
+| `vol_baseline` | all 1.0 | 0.10 | 20 | 30% | ✓ | – | – | 4.5 |
+| `vol_conservative` | rsi+mom 1.0, macd 0.8, rev 0.6, sect 0.5 | 0.15 | 15 | 25% | ✓ | – | – | 4.5 |
+| `vol_regime_adaptive` | all 1.0 + overrides | 0.10 | 20 | 30% | ✓ | – | – | 4.5 |
+| `vol_vroc_adaptive` | conservative weights + overrides | 0.10 | 20 | 30% | ✓ | ✓ | – | 4.6 |
+| `vol_hard_cb` | conservative weights + overrides | 0.10 | 20 | 30% | ✓ | ✓ | binary | 4.7 |
+| `vol_hard_cb_tight` | same (tighter CB 10% trigger) | 0.10 | 20 | 30% | ✓ | ✓ | binary | 4.7 |
+| `vol_soft_cb` | conservative weights + overrides | 0.10 | 20 | 30% | ✓ | ✓ | soft | 4.8 |
+| `vol_soft_cb_full` | conservative + crisis limits + floor | 0.10 | 20 | 30% | ✓ | ✓ | soft | 4.8 |
+| `vol_conservative_full` | conservative + full stack | 0.15 | 12 | 20% | ✓ | ✓ | soft | 4.8 |
 | `vol_recovery_v1` | conservative + crisis + recovery triggers | 0.10 | 20 | 30% | ✓ | ✓ | soft + recovery | 4.10 |
+| `chatgpt_adaptive_recovery` | custom weights + crisis + recovery triggers | 0.12 | 16 | 25% | ✓ | ✓ | soft + recovery | 4.10 |
 
 *Columns: `min_str` = min\_strength, Pos = max\_open\_positions, Sec = max\_sector\_exposure, Vol = use\_vol\_filter, CB = circuit breaker type.*
 
-`vol_filtered_default` is a direct apples-to-apples comparison against
+`vol_baseline` is a direct apples-to-apples comparison against
 `live_default`. Any performance difference is attributable solely to the VIX
 filter.
 

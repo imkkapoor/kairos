@@ -9,3 +9,4 @@ backend/logs/
 node_modules/
 .next/
 dist/
+.foglamp/
